@@ -29,13 +29,9 @@ class TunnelClient {
         // Configuration
         this.requestTimeout = options.requestTimeout || 30000; // 30 seconds
         this.maxRequestSize = options.maxRequestSize || 10 * 1024 * 1024; // 10MB
-        this.streamThreshold = options.streamThreshold || 512 * 1024; // 512KB for streaming
-        this.maxStreamSize = options.maxStreamSize || 100 * 1024 * 1024; // 100MB max
-        this.chunkSize = options.chunkSize || 64 * 1024; // 64KB chunks
-        this.streamTimeout = options.streamTimeout || 60000; // 1 minute for streams
+        this.maxResponseSize = options.maxResponseSize || 100 * 1024 * 1024; // 100MB max
         this.retryAttempts = options.retryAttempts || 3;
         this.retryDelay = options.retryDelay || 1000;
-        this.enableCompression = options.enableCompression !== false;
 
         // Statistics
         this.stats = {
@@ -43,7 +39,6 @@ class TunnelClient {
             requestsSucceeded: 0,
             requestsFailed: 0,
             bytesTransferred: 0,
-            streamsProcessed: 0,
             startTime: null,
             lastRequestTime: null
         };
@@ -198,7 +193,7 @@ class TunnelClient {
         // Create worker pool
         this.workerPool = new WorkerPool(this.concurrency, {
             maxQueueSize: this.concurrency * 10,
-            taskTimeout: this.streamTimeout, // Use stream timeout for large files
+            taskTimeout: this.requestTimeout,
             enableBackpressure: true
         });
 
@@ -252,11 +247,10 @@ class TunnelClient {
                         concurrency: this.concurrency,
                         local_host: this.localHost,
                         features: {
-                            compression: this.enableCompression,
-                            streaming: true,
+                            raw_binary: true,
                             chunked_transfer: true,
                             max_request_size: this.maxRequestSize,
-                            stream_threshold: this.streamThreshold
+                            max_response_size: this.maxResponseSize
                         }
                     }
                 })
@@ -344,7 +338,8 @@ class TunnelClient {
             }
 
             // Check request size limits
-            const bodySize = requestData.body ? requestData.body.length : 0;
+            const bodySize = requestData.body ? 
+                (requestData.body instanceof ArrayBuffer ? requestData.body.byteLength : requestData.body.length) : 0;
             if (bodySize > this.maxRequestSize) {
                 return this.createErrorResponse(413, 'Payload Too Large',
                     `Request body too large: ${bodySize} bytes (max: ${this.maxRequestSize})`);
@@ -354,7 +349,7 @@ class TunnelClient {
             const response = await this.proxyToLocal(requestData, route);
 
             this.stats.requestsSucceeded++;
-            this.stats.bytesTransferred += (response.body ? response.body.length : 0);
+            this.stats.bytesTransferred += (response.body ? response.body.byteLength : 0);
 
             const duration = Date.now() - startTime;
             console.info(`${requestData.method} ${requestData.path} -> ${route.port} (${response.status}) ${duration}ms`);
@@ -376,7 +371,7 @@ class TunnelClient {
     }
 
     /**
-     * Proxies request to local server with retry logic and improved error handling
+     * Proxies request to local server with retry logic
      * @param {object} requestData - Original request data
      * @param {object} route - Matched route
      * @returns {object} - Response data
@@ -424,322 +419,99 @@ class TunnelClient {
         // All attempts failed
         throw new Error(`Failed after ${this.retryAttempts} attempts: ${lastError.message}`);
     }
-
-    /**
-     * Performs single HTTP request with comprehensive timeout handling
+    
+   /**
+     * Performs single HTTP request with timeout handling
      * @param {string} url - Target URL
      * @param {object} requestData - Request data
      * @param {object} route - Route information
      * @param {AbortController} controller - Abort controller
-     * @returns {object} - Response data
+     * @returns {object} - Response data with ArrayBuffer body
      */
-    async performRequest(url, requestData, route, controller) {
-        // Overall timeout for the entire operation
-        const overallTimeoutId = setTimeout(() => {
-            controller.abort();
-        }, this.requestTimeout);
+   async performRequest(url, requestData, route, controller) {
+    // Overall timeout for the entire operation
+    const overallTimeoutId = setTimeout(() => {
+        controller.abort();
+    }, this.requestTimeout);
 
-        try {
-            // Prepare headers
-            const headers = { ...requestData.headers };
+    try {
+        // Prepare headers
+        const headers = { ...requestData.headers };
 
-            // Set Host header appropriately for virtual hosts (case-insensitive check)
-            const hostHeaderKey = Object.keys(requestData.headers).find(key =>
-                key.toLowerCase() === 'host'
-            );
-            const hostHeaderValue = hostHeaderKey ? requestData.headers[hostHeaderKey] : null;
+        // Set Host header appropriately for virtual hosts (case-insensitive check)
+        const hostHeaderKey = Object.keys(requestData.headers).find(key =>
+            key.toLowerCase() === 'host'
+        );
+        const hostHeaderValue = hostHeaderKey ? requestData.headers[hostHeaderKey] : null;
 
-            if (hostHeaderValue) {
-                headers['Host'] = hostHeaderValue;
-            } else {
-                headers['Host'] = `${this.localHost}:${route.port}`;
-            }
-
-            // Add compression support
-            if (this.enableCompression && !headers['accept-encoding']) {
-                headers['Accept-Encoding'] = 'gzip, deflate';
-            }
-
-            // Remove problematic headers that fetch will handle
-            delete headers['content-length'];
-            delete headers['connection'];
-            delete headers['transfer-encoding'];
-
-            const response = await fetch(url, {
-                method: requestData.method,
-                signal: controller.signal,
-                headers: headers,
-                body: requestData.body || undefined
-            });
-
-            // Process response with intelligent streaming
-            return await this.processResponseIntelligently(response, controller);
-
-        } finally {
-            clearTimeout(overallTimeoutId);
+        if (hostHeaderValue) {
+            headers['Host'] = hostHeaderValue;
+        } else {
+            headers['Host'] = `${this.localHost}:${route.port}`;
         }
+
+        // Remove problematic headers that fetch will handle
+        delete headers['content-length'];
+        delete headers['connection'];
+        delete headers['transfer-encoding'];
+
+        // Prepare fetch options
+        const fetchOptions = {
+            method: requestData.method,
+            signal: controller.signal,
+            headers: headers
+        };
+
+        // Only add body for methods that support it
+        if (requestData.method !== 'GET' && requestData.method !== 'HEAD') {
+            fetchOptions.body = requestData.body;
+        }
+
+        const response = await fetch(url, fetchOptions);
+
+        // Process response - ALL DATA AS RAW BINARY (ArrayBuffer)
+        return await this.processResponse(response);
+
+    } finally {
+        clearTimeout(overallTimeoutId);
     }
+}
 
     /**
-     * Intelligently processes response based on content type and size
+     * Processes response and returns RAW BINARY data as ArrayBuffer
      * @param {Response} response - Fetch response
-     * @param {AbortController} controller - Abort controller
-     * @returns {object} - Processed response data
+     * @returns {object} - Response data with ArrayBuffer body
      */
-    async processResponseIntelligently(response, controller) {
+    async processResponse(response) {
         // Collect response headers
         const responseHeaders = {};
         for (const [key, value] of response.headers.entries()) {
             responseHeaders[key] = value;
         }
 
-        const contentLength = this.parseContentLength(response.headers.get('content-length'));
-        const contentType = response.headers.get('content-type') || '';
-        const contentEncoding = response.headers.get('content-encoding') || '';
+        // Check response size
+        const contentLength = response.headers.get('content-length');
+        if (contentLength) {
+            const size = parseInt(contentLength, 10);
+            if (size > this.maxResponseSize) {
+                throw new Error(`Response too large: ${size} bytes (max: ${this.maxResponseSize})`);
+            }
+        }
 
-        // Detect if content is binary based on multiple factors
-        const isBinary = this.detectBinaryContent(contentType, response.headers);
+        // Get response body as RAW BINARY (ArrayBuffer)
+        const body = await response.arrayBuffer();
 
-        // Determine processing strategy
-        const shouldStream = this.shouldUseStreaming(contentLength, isBinary, contentEncoding);
-
-        let body;
-
-        if (shouldStream) {
-            // Use memory-efficient streaming for large content
-            body = await this.processStreamingResponse(response, controller, isBinary);
-            this.stats.streamsProcessed++;
-        } else {
-            // Load smaller content into memory
-            body = await this.processBufferedResponse(response, isBinary);
+        // Final size check
+        if (body.byteLength > this.maxResponseSize) {
+            throw new Error(`Response too large: ${body.byteLength} bytes (max: ${this.maxResponseSize})`);
         }
 
         return {
             status: response.status,
             statusText: response.statusText,
             headers: responseHeaders,
-            body: body || ''
+            body: body // ArrayBuffer - RAW BINARY
         };
-    }
-
-    /**
-     * Safely parses content-length header
-     * @param {string} contentLengthHeader - Content-Length header value
-     * @returns {number} - Parsed content length or 0
-     */
-    parseContentLength(contentLengthHeader) {
-        if (!contentLengthHeader) return 0;
-        const parsed = parseInt(contentLengthHeader, 10);
-        return isNaN(parsed) ? 0 : parsed;
-    }
-
-    /**
-     * Detects if content is binary based on multiple signals
-     * @param {string} contentType - Content-Type header
-     * @param {Headers} headers - Response headers
-     * @returns {boolean} - True if content is likely binary
-     */
-    detectBinaryContent(contentType, headers) {
-        // Normalize content type by extracting main type before semicolon
-        const mainContentType = contentType.split(';')[0].trim().toLowerCase();
-
-        // Text content types
-        const textTypes = [
-            'text/',
-            'application/json',
-            'application/xml',
-            'application/javascript',
-            'application/x-javascript',
-            'application/ecmascript',
-            'application/rss+xml',
-            'application/atom+xml'
-        ];
-
-        if (textTypes.some(type => mainContentType.includes(type))) {
-            return false;
-        }
-
-        // Binary content types
-        const binaryTypes = [
-            'image/',
-            'video/',
-            'audio/',
-            'application/octet-stream',
-            'application/pdf',
-            'application/zip',
-            'application/x-rar-compressed',
-            'application/x-tar',
-            'application/x-gzip'
-        ];
-
-        if (binaryTypes.some(type => mainContentType.includes(type))) {
-            return true;
-        }
-
-        // If no content-type or unknown, assume text for safety
-        return false;
-    }
-
-    /**
-     * Determines if streaming should be used
-     * @param {number} contentLength - Content length
-     * @param {boolean} isBinary - Is binary content
-     * @param {string} contentEncoding - Content encoding
-     * @returns {boolean} - True if streaming should be used
-     */
-    shouldUseStreaming(contentLength, isBinary, contentEncoding) {
-        // Always stream if content-length is above threshold
-        if (contentLength > this.streamThreshold) {
-            return true;
-        }
-
-        // Stream compressed content regardless of size (can't trust content-length)
-        if (contentEncoding && contentEncoding !== 'identity') {
-            return true;
-        }
-
-        // Stream binary content above a smaller threshold
-        if (isBinary && contentLength > this.streamThreshold / 4) {
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * Processes response using memory-efficient streaming with fallback
-     * @param {Response} response - Fetch response
-     * @param {AbortController} controller - Abort controller
-     * @param {boolean} isBinary - Is binary content
-     * @returns {string} - Processed response body
-     */
-    async processStreamingResponse(response, controller, isBinary) {
-        try {
-            return await this.attemptStreamingRead(response, controller, isBinary);
-        } catch (error) {
-            // Fallback to buffered approach if streaming fails
-            console.warn('Streaming failed, falling back to buffered read:', error.message);
-            return await this.processBufferedResponse(response, isBinary);
-        }
-    }
-
-    /**
-     * Attempts to read response using streaming
-     * @param {Response} response - Fetch response
-     * @param {AbortController} controller - Abort controller
-     * @param {boolean} isBinary - Is binary content
-     * @returns {string} - Processed response body
-     */
-    async attemptStreamingRead(response, controller, isBinary) {
-        const reader = response.body.getReader();
-        const chunks = [];
-        let totalSize = 0;
-
-        // Adaptive stream timeout based on expected size
-        const streamTimeout = Math.max(30000, Math.min(this.streamTimeout, 300000)); // 30s to 5min
-        let streamTimeoutId = null;
-
-        const resetStreamTimeout = () => {
-            if (streamTimeoutId) {
-                clearTimeout(streamTimeoutId);
-            }
-            streamTimeoutId = setTimeout(() => {
-                controller.abort();
-            }, streamTimeout);
-        };
-
-        try {
-            resetStreamTimeout();
-
-            while (true) {
-                const { done, value } = await reader.read();
-
-                if (done) break;
-
-                totalSize += value.length;
-
-                // Check size limits
-                if (totalSize > this.maxStreamSize) {
-                    throw new Error(`Response stream too large: ${totalSize} bytes (max: ${this.maxStreamSize})`);
-                }
-
-                chunks.push(value);
-
-                // Reset timeout on each successful read
-                resetStreamTimeout();
-
-                // Memory pressure relief - if we have too many chunks, combine them
-                if (chunks.length > 100) {
-                    const combined = this.combineChunks(chunks.splice(0, 50));
-                    chunks.unshift(combined);
-                }
-            }
-
-            // Combine all chunks efficiently
-            const finalBuffer = this.combineChunks(chunks);
-
-            // Clear chunks to help GC
-            chunks.length = 0;
-
-            if (isBinary) {
-                return Buffer.from(finalBuffer).toString('base64');
-            } else {
-                // Safe text decoding with error handling
-                try {
-                    return new TextDecoder('utf-8', { fatal: false }).decode(finalBuffer);
-                } catch (decodeError) {
-                    // Fallback to binary handling if text decoding fails
-                    return Buffer.from(finalBuffer).toString('base64');
-                }
-            }
-
-        } finally {
-            if (streamTimeoutId) {
-                clearTimeout(streamTimeoutId);
-            }
-
-            try {
-                reader.releaseLock();
-            } catch (error) {
-                // Ignore release errors
-            }
-        }
-    }
-
-    /**
-     * Efficiently combines chunks into a single buffer
-     * @param {Array} chunks - Array of Uint8Array chunks
-     * @returns {Uint8Array} - Combined buffer
-     */
-    combineChunks(chunks) {
-        if (chunks.length === 0) return new Uint8Array(0);
-        if (chunks.length === 1) return chunks[0];
-
-        const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-        const combined = new Uint8Array(totalLength);
-        let offset = 0;
-
-        for (const chunk of chunks) {
-            combined.set(chunk, offset);
-            offset += chunk.length;
-        }
-
-        return combined;
-    }
-
-    /**
-     * Processes smaller responses by loading into memory
-     * @param {Response} response - Fetch response
-     * @param {boolean} isBinary - Is binary content
-     * @returns {string} - Response body
-     */
-    async processBufferedResponse(response, isBinary) {
-        if (isBinary) {
-            const buffer = await response.arrayBuffer();
-            return Buffer.from(buffer).toString('base64');
-        } else {
-            return await response.text();
-        }
     }
 
     /**
@@ -747,9 +519,13 @@ class TunnelClient {
      * @param {number} status - HTTP status code
      * @param {string} statusText - HTTP status text
      * @param {string} message - Error message
-     * @returns {object} - Error response
+     * @returns {object} - Error response with ArrayBuffer body
      */
     createErrorResponse(status, statusText, message) {
+        // Convert error message to ArrayBuffer
+        const encoder = new TextEncoder();
+        const body = encoder.encode(message).buffer;
+
         return {
             status,
             statusText,
@@ -757,7 +533,7 @@ class TunnelClient {
                 'Content-Type': 'text/plain',
                 'X-Tunnel-Error': 'true'
             },
-            body: message
+            body: body // ArrayBuffer
         };
     }
 
@@ -806,9 +582,7 @@ class TunnelClient {
                 ...this.stats,
                 requestRate: `${requestRate} req/s`,
                 successRate: this.stats.requestsProcessed > 0 ?
-                    `${((this.stats.requestsSucceeded / this.stats.requestsProcessed) * 100).toFixed(1)}%` : '0%',
-                streamingRate: this.stats.requestsProcessed > 0 ?
-                    `${((this.stats.streamsProcessed / this.stats.requestsProcessed) * 100).toFixed(1)}%` : '0%'
+                    `${((this.stats.requestsSucceeded / this.stats.requestsProcessed) * 100).toFixed(1)}%` : '0%'
             },
             poller: this.poller ? this.poller.getStatus() : null,
             workerPool: this.workerPool ? this.workerPool.getStatus() : null

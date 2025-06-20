@@ -242,19 +242,46 @@ class Poller {
         throw new Error(`Poll request failed: ${response.status} ${response.statusText}`);
       }
 
+      // Extract metadata from headers
+      const requestId = response.headers.get('X-Request-ID');
+      const method = response.headers.get('X-Method');
+      const path = response.headers.get('X-Path');
+      const query = response.headers.get('X-Query');
+      const headersJson = response.headers.get('X-Headers');
+      const timestamp = response.headers.get('X-Timestamp');
+
+      if (!requestId || !method || !path) {
+        throw new Error('Missing required request metadata in headers');
+      }
+
+      // Parse request headers
+      let requestHeaders = {};
+      if (headersJson) {
+        try {
+          requestHeaders = JSON.parse(headersJson);
+        } catch (parseError) {
+          console.warn('Failed to parse request headers:', parseError.message);
+        }
+      }
+
+      // Get RAW BINARY body as ArrayBuffer
+      const body = await response.arrayBuffer();
+
       // Check content size
-      const contentLength = response.headers.get('content-length');
-      if (contentLength && parseInt(contentLength) > this.maxRequestSize) {
-        throw new Error(`Request too large: ${contentLength} bytes`);
+      if (body.byteLength > this.maxRequestSize) {
+        throw new Error(`Request too large: ${body.byteLength} bytes`);
       }
 
-      // Check content type before parsing JSON
-      const contentType = response.headers.get('content-type');
-      if (!contentType || !contentType.includes('application/json')) {
-        throw new Error(`Invalid content type: ${contentType}`);
-      }
-
-      const requestData = await response.json();
+      // Reconstruct request data
+      const requestData = {
+        id: requestId,
+        method: method,
+        path: path,
+        query: query || '',
+        headers: requestHeaders,
+        body: body, // ArrayBuffer - RAW BINARY
+        timestamp: timestamp ? parseInt(timestamp, 10) : Date.now()
+      };
       
       if (requestData && requestData.id) {
         // Process request through worker pool with timeout
@@ -308,7 +335,7 @@ class Poller {
       await this.sendResponse(requestData.id, {
         status: 500,
         headers: { 'Content-Type': 'text/plain' },
-        body: 'Internal tunnel error'
+        body: new TextEncoder().encode('Internal tunnel error').buffer // ArrayBuffer
       });
     }
   }
@@ -316,7 +343,7 @@ class Poller {
   /**
    * Sends response back to the server
    * @param {string} requestId - Request identifier
-   * @param {object} response - Response data
+   * @param {object} response - Response data with ArrayBuffer body
    */
   async sendResponse(requestId, response) {
     const controller = new AbortController();
@@ -326,21 +353,19 @@ class Poller {
       const responseUrl = this.buildApiUrl('response');
       
       const headers = {
-        'Content-Type': 'application/json',
+        'X-Request-ID': requestId,
+        'X-Tunnel-ID': this.tunnelId,
+        'X-Response-Status': String(response.status || 200),
+        'X-Response-Headers': JSON.stringify(response.headers || {}),
         ...this.getBaseHeaders()
       };
-      
+
+      // Send ArrayBuffer directly as body - NO JSON serialization
       const result = await fetch(responseUrl, {
         method: 'POST',
         signal: controller.signal,
         headers: headers,
-        body: JSON.stringify({
-          request_id: requestId,
-          tunnel_id: this.tunnelId,
-          status: response.status || 200,
-          headers: response.headers || {},
-          body: response.body || ''
-        })
+        body: response.body || new ArrayBuffer(0) // Direct ArrayBuffer transmission
       });
 
       if (!result.ok) {

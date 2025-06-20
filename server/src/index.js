@@ -228,11 +228,19 @@ async function handlePoll(request, env) {
       });
     }
 
-    return new Response(JSON.stringify(requestData), {
+    // Send ArrayBuffer directly as body + metadata in headers
+    const headers = addCORSHeaders({
+      'X-Request-ID': requestData.id,
+      'X-Method': requestData.method,
+      'X-Path': requestData.path,
+      'X-Query': requestData.query || '',
+      'X-Headers': JSON.stringify(requestData.headers || {}),
+      'X-Timestamp': String(requestData.timestamp)
+    });
+
+    return new Response(requestData.body || new ArrayBuffer(0), {
       status: 200,
-      headers: addCORSHeaders({
-        'Content-Type': 'application/json'
-      })
+      headers: headers
     });
   } catch (error) {
     console.error('Poll error:', error.message);
@@ -246,7 +254,7 @@ async function handlePoll(request, env) {
 }
 
 /**
- * Handles response from tunnel client
+ * Handles response from tunnel client - RAW BINARY ArrayBuffer + metadata in headers
  */
 async function handleResponse(request, env) {
   if (request.method !== 'POST') {
@@ -264,20 +272,37 @@ async function handleResponse(request, env) {
   }
 
   try {
-    const body = await request.json();
-    const { request_id, tunnel_id, status, headers, body: responseBody } = body;
+    // Extract metadata from headers
+    const requestId = request.headers.get('X-Request-ID');
+    const tunnelId = request.headers.get('X-Tunnel-ID');
+    const responseStatus = request.headers.get('X-Response-Status');
+    const responseHeadersJson = request.headers.get('X-Response-Headers');
     
-    if (!request_id) {
-      return new Response('Missing request_id', { 
+    if (!requestId) {
+      return new Response('Missing X-Request-ID header', { 
         status: 400,
         headers: addCORSHeaders({})
       });
     }
 
-    await requestQueue.resolveRequest(request_id, {
-      status: status || 200,
-      headers: headers || {},
-      body: responseBody || ''
+    // Parse response headers
+    let responseHeaders = {};
+    if (responseHeadersJson) {
+      try {
+        responseHeaders = JSON.parse(responseHeadersJson);
+      } catch (parseError) {
+        console.warn('Failed to parse response headers:', parseError.message);
+      }
+    }
+
+    // Get RAW BINARY body as ArrayBuffer
+    const body = await request.arrayBuffer();
+
+    // Resolve request with ArrayBuffer response
+    await requestQueue.resolveRequest(requestId, {
+      status: parseInt(responseStatus, 10) || 200,
+      headers: responseHeaders,
+      body: body // ArrayBuffer - RAW BINARY
     });
 
     return new Response(JSON.stringify({ success: true }), {
@@ -349,12 +374,11 @@ async function handleHeartbeat(request, env) {
  * Handles public requests (proxy to tunnels)
  */
 async function handlePublicRequest(request, env, ctx) {
-    const url = new URL(request.url); 
-    
+    const url = new URL(request.url);  
     // Find matching tunnel by path
     const tunnel = await tunnelManager.findTunnelByPath(url.pathname); 
     
-    if (!tunnel) { 
+    if (!tunnel) {  
       return new Response('Not Found', { 
         status: 404,
         headers: addCORSHeaders({
@@ -362,15 +386,12 @@ async function handlePublicRequest(request, env, ctx) {
         })
       });
     }
-   
-    
+     
     try {
-      // Convert request to data for tunneling
-      const requestData = await serializeRequest(request);
-    
-      // Queue request and wait for response
-      const response = await requestQueue.queueRequest(tunnel.id, requestData, 30000);
- 
+      // Convert request to data for tunneling 
+      const requestData = await serializeRequest(request); 
+      // Queue request and wait for response 
+      const response = await requestQueue.queueRequest(tunnel.id, requestData, 30000); 
       
       // Build HTTP response from tunnel response with CORS
       const httpResponse = await responseBuilder.buildResponse(response);
@@ -385,6 +406,7 @@ async function handlePublicRequest(request, env, ctx) {
       
     } catch (error) {
       console.error('❌ Public request error:', error.message);
+      console.error('❌ Error stack:', error.stack);
       
       if (error.message === 'Request timeout') {
         return new Response('Gateway Timeout', { 
@@ -404,7 +426,7 @@ async function handlePublicRequest(request, env, ctx) {
     }
   }
 /**
- * Serializes HTTP request for tunneling
+ * Serializes HTTP request for tunneling - ALL DATA AS RAW BINARY
  * @param {Request} request - HTTP request
  */
 async function serializeRequest(request) {
@@ -421,20 +443,20 @@ async function serializeRequest(request) {
     headers[key] = value;
   }
 
-  // Get body if present with size limit
-  let body = '';
+  // Get body as RAW BINARY ArrayBuffer
+  let body = new ArrayBuffer(0);
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     try {
-      const text = await request.text();
-      if (text.length > 10 * 1024 * 1024) { // 10MB limit
+      const arrayBuffer = await request.arrayBuffer();
+      if (arrayBuffer.byteLength > 10 * 1024 * 1024) { // 10MB limit
         throw new Error('Request body too large');
       }
-      body = text;
+      body = arrayBuffer;
     } catch (error) {
       if (error.message === 'Request body too large') {
         throw error;
       }
-      // Ignore other body read errors
+      // Ignore other body read errors, use empty ArrayBuffer
     }
   }
 
@@ -444,7 +466,7 @@ async function serializeRequest(request) {
     path: url.pathname,
     query: url.search.substring(1), // Remove leading '?'
     headers: headers,
-    body: body,
+    body: body, // ArrayBuffer - RAW BINARY
     timestamp: Date.now()
   };
 }
@@ -457,7 +479,7 @@ function handleCORS() {
     status: 200,
     headers: {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       'Access-Control-Max-Age': '86400'
     }
@@ -472,7 +494,7 @@ function addCORSHeaders(headers = {}) {
   return {
     ...headers,
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization'
   };
 }
