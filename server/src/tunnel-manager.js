@@ -4,12 +4,18 @@ export default class TunnelManager {
   /**
    * Creates a new tunnel manager
    * @param {Map} activeTunnels - Global tunnels storage
+   * @param {RequestQueue} requestQueue - Request queue manager for cleanup
    */
-  constructor(activeTunnels) {
+  constructor(activeTunnels, requestQueue = null) {
     this.activeTunnels = activeTunnels;
+    this.requestQueue = requestQueue; // Add reference to request queue for cleanup
     this.tunnelTimeout = 10 * 60 * 1000; // 10 minutes
     this.lastCleanup = Date.now();
     this.cleanupInterval = 60000; // 1 minute
+    this.cleanupTimer = null;
+    
+    // Start automatic cleanup
+    this.startPeriodicCleanup();
   }
 
   /**
@@ -47,7 +53,9 @@ export default class TunnelManager {
         local_host: client_info.local_host || 'localhost',
         features: client_info.features || {}
       },
-      status: 'active'
+      status: 'active',
+      last_poll: Date.now(), // Track when client last polled
+      polls_count: 0 // Track polling activity
     };
 
     // Store tunnel
@@ -64,7 +72,7 @@ export default class TunnelManager {
   }
 
   /**
-   * Unregisters a tunnel
+   * Unregisters a tunnel with proper cleanup
    * @param {string} tunnelId - Tunnel ID to remove
    */
   async unregisterTunnel(tunnelId) {
@@ -77,8 +85,39 @@ export default class TunnelManager {
       throw new Error('Tunnel not found');
     }
 
+    // Clean up tunnel data
+    await this.cleanupTunnel(tunnelId);
+    
+    console.log(`Tunnel unregistered and cleaned up: ${tunnelId}`);
+  }
+
+  /**
+   * Properly cleans up all tunnel data
+   * @param {string} tunnelId - Tunnel ID to clean up
+   */
+  async cleanupTunnel(tunnelId) {
+    // Remove tunnel from active tunnels
     this.activeTunnels.delete(tunnelId);
-    console.log(`Tunnel unregistered: ${tunnelId}`);
+    
+    // Clean up request queue if available
+    if (this.requestQueue) {
+      this.requestQueue.cancelTunnelRequests(tunnelId);
+    }
+    
+    console.log(`Cleaned up all data for tunnel: ${tunnelId}`);
+  }
+
+  /**
+   * Updates polling activity for a tunnel
+   * @param {string} tunnelId - Tunnel ID
+   */
+  updatePollingActivity(tunnelId) {
+    const tunnel = this.activeTunnels.get(tunnelId);
+    if (tunnel) {
+      tunnel.last_poll = Date.now();
+      tunnel.polls_count = (tunnel.polls_count || 0) + 1;
+      tunnel.last_seen = Date.now(); // Also update last_seen
+    }
   }
 
   /**
@@ -101,6 +140,13 @@ export default class TunnelManager {
     for (const [tunnelId, tunnel] of this.activeTunnels) {
       if (tunnel.status !== 'active') {
         continue;
+      }
+
+      // Check if tunnel is recently active (polled within last 2 minutes)
+      const timeSinceLastPoll = Date.now() - (tunnel.last_poll || tunnel.last_seen);
+      if (timeSinceLastPoll > 2 * 60 * 1000) {
+        console.warn(`Tunnel ${tunnelId} found but hasn't polled recently (${Math.round(timeSinceLastPoll/1000)}s ago)`);
+        continue; // Skip inactive tunnels
       }
 
       for (const rule of tunnel.forward_rules) {
@@ -149,13 +195,19 @@ export default class TunnelManager {
   }
 
   /**
-   * Checks if tunnel is active
+   * Checks if tunnel is active and recently polled
    * @param {string} tunnelId - Tunnel ID to check
    * @returns {boolean} - True if tunnel exists and is active
    */
   isActive(tunnelId) {
     const tunnel = this.activeTunnels.get(tunnelId);
-    return tunnel && tunnel.status === 'active';
+    if (!tunnel || tunnel.status !== 'active') {
+      return false;
+    }
+    
+    // Check if tunnel has polled recently
+    const timeSinceLastPoll = Date.now() - (tunnel.last_poll || tunnel.last_seen);
+    return timeSinceLastPoll < 5 * 60 * 1000; // 5 minutes
   }
 
   /**
@@ -167,6 +219,88 @@ export default class TunnelManager {
     if (tunnel) {
       tunnel.last_seen = Date.now();
     }
+  }
+
+  /**
+   * Starts periodic cleanup of inactive tunnels
+   */
+  startPeriodicCleanup() {
+    // Clear any existing timer
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+    
+    // Start new cleanup timer
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupInactiveTunnels();
+    }, this.cleanupInterval);
+    
+    console.log('Started periodic tunnel cleanup timer');
+  }
+
+  /**
+   * Stops periodic cleanup
+   */
+  stopPeriodicCleanup() {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+      console.log('Stopped periodic tunnel cleanup timer');
+    }
+  }
+
+  /**
+   * Removes inactive tunnels that haven't sent heartbeat or polled
+   */
+  cleanupInactiveTunnels() {
+    const now = Date.now();
+    const expired = [];
+    const warnings = [];
+
+    for (const [tunnelId, tunnel] of this.activeTunnels) {
+      const timeSinceLastSeen = now - tunnel.last_seen;
+      const timeSinceLastPoll = now - (tunnel.last_poll || tunnel.last_seen);
+
+      // Mark as expired if no heartbeat for tunnel timeout period
+      if (timeSinceLastSeen > this.tunnelTimeout) {
+        expired.push({
+          id: tunnelId,
+          reason: `No heartbeat for ${Math.round(timeSinceLastSeen/1000)}s`
+        });
+      }
+      // Also mark as expired if no polling activity for extended period
+      else if (timeSinceLastPoll > this.tunnelTimeout * 0.5) {
+        expired.push({
+          id: tunnelId,
+          reason: `No polling for ${Math.round(timeSinceLastPoll/1000)}s`
+        });
+      }
+      // Warn about tunnels that haven't polled recently
+      else if (timeSinceLastPoll > 2 * 60 * 1000) {
+        warnings.push({
+          id: tunnelId,
+          lastPoll: Math.round(timeSinceLastPoll/1000)
+        });
+      }
+    }
+
+    // Log warnings for inactive tunnels
+    for (const warning of warnings) {
+      console.warn(`Tunnel ${warning.id} hasn't polled for ${warning.lastPoll}s`);
+    }
+
+    // Remove expired tunnels
+    for (const expiredTunnel of expired) {
+      this.cleanupTunnel(expiredTunnel.id);
+      console.log(`Cleaned up expired tunnel: ${expiredTunnel.id} (${expiredTunnel.reason})`);
+    }
+
+    if (expired.length > 0) {
+      console.log(`Cleanup completed: removed ${expired.length} expired tunnels`);
+    }
+
+    // Update last cleanup time
+    this.lastCleanup = now;
   }
 
   /**
@@ -226,43 +360,6 @@ export default class TunnelManager {
     return `tunnel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
 
- 
-  /**
-   * Starts cleanup timer for inactive tunnels
-   */
-  startCleanupTimer() {
-    // Run cleanup every minute
-    setInterval(() => {
-      this.cleanupInactiveTunnels();
-    }, 60000);
-  }
-
-  /**
-   * Removes inactive tunnels that haven't sent heartbeat
-   */
-  cleanupInactiveTunnels() {
-    const now = Date.now();
-    const expired = [];
-
-    for (const [tunnelId, tunnel] of this.activeTunnels) {
-      const timeSinceLastSeen = now - tunnel.last_seen;
-
-      if (timeSinceLastSeen > this.tunnelTimeout) {
-        expired.push(tunnelId);
-      }
-    }
-
-    // Remove expired tunnels
-    for (const tunnelId of expired) {
-      this.activeTunnels.delete(tunnelId);
-      console.log(`Cleaned up inactive tunnel: ${tunnelId}`);
-    }
-
-    if (expired.length > 0) {
-      console.log(`Cleanup completed: removed ${expired.length} inactive tunnels`);
-    }
-  }
-
   /**
    * Gets statistics about active tunnels
    * @returns {object} - Tunnel statistics
@@ -271,20 +368,31 @@ export default class TunnelManager {
     const totalTunnels = this.activeTunnels.size;
     const now = Date.now();
     let activeTunnels = 0;
+    let recentlyPolled = 0;
     let totalRules = 0;
+    let totalPolls = 0;
 
     for (const [tunnelId, tunnel] of this.activeTunnels) {
       if (tunnel.status === 'active') {
         activeTunnels++;
         totalRules += tunnel.forward_rules.length;
+        totalPolls += tunnel.polls_count || 0;
+        
+        const timeSinceLastPoll = now - (tunnel.last_poll || tunnel.last_seen);
+        if (timeSinceLastPoll < 2 * 60 * 1000) {
+          recentlyPolled++;
+        }
       }
     }
 
     return {
       total_tunnels: totalTunnels,
       active_tunnels: activeTunnels,
+      recently_polled: recentlyPolled,
       total_rules: totalRules,
-      cleanup_timeout: this.tunnelTimeout
+      total_polls: totalPolls,
+      cleanup_timeout: this.tunnelTimeout,
+      cleanup_running: this.cleanupTimer !== null
     };
   }
 
@@ -296,16 +404,35 @@ export default class TunnelManager {
     const tunnels = [];
 
     for (const [tunnelId, tunnel] of this.activeTunnels) {
+      const now = Date.now();
       tunnels.push({
         id: tunnelId,
         status: tunnel.status,
         created_at: tunnel.created_at,
         last_seen: tunnel.last_seen,
+        last_poll: tunnel.last_poll,
+        time_since_last_poll: tunnel.last_poll ? now - tunnel.last_poll : null,
+        polls_count: tunnel.polls_count || 0,
         rules_count: tunnel.forward_rules.length,
         client_version: tunnel.client_info.version
       });
     }
 
     return tunnels;
+  }
+
+  /**
+   * Emergency cleanup - removes all tunnels (for shutdown)
+   */
+  shutdown() {
+    this.stopPeriodicCleanup();
+    
+    // Clean up all tunnels
+    const tunnelIds = Array.from(this.activeTunnels.keys());
+    for (const tunnelId of tunnelIds) {
+      this.cleanupTunnel(tunnelId);
+    }
+    
+    console.log(`Tunnel manager shutdown: cleaned up ${tunnelIds.length} tunnels`);
   }
 }

@@ -4,15 +4,30 @@ import TunnelManager from './tunnel-manager.js';
 import RequestQueue from './request-queue.js';
 import ResponseBuilder from './utils/response-builder.js';
 
-// Global storage (in-memory)
+// Global storage (in-memory) - these persist across requests in the same isolate
 const activeTunnels = new Map();
 const requestQueues = new Map(); 
 const pendingResponses = new Map();
 
-// Initialize managers
-const tunnelManager = new TunnelManager(activeTunnels);
-const requestQueue = new RequestQueue(requestQueues, pendingResponses);
-const responseBuilder = new ResponseBuilder();
+// Initialize managers with proper cleanup integration
+let tunnelManager = null;
+let requestQueue = null;
+let responseBuilder = null;
+let isInitialized = false;
+
+/**
+ * Initialize managers with proper cross-references
+ */
+function initializeManagers() {
+  if (!isInitialized) {
+    requestQueue = new RequestQueue(requestQueues, pendingResponses);
+    tunnelManager = new TunnelManager(activeTunnels, requestQueue); // Pass requestQueue for cleanup
+    responseBuilder = new ResponseBuilder();
+    isInitialized = true;
+    
+    console.log('FlarePipe server managers initialized');
+  }
+}
 
 /**
  * Main worker entry point
@@ -20,6 +35,9 @@ const responseBuilder = new ResponseBuilder();
 export default {
   async fetch(request, env, ctx) {
     try {
+      // Initialize managers on first request
+      initializeManagers();
+      
       return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('Unhandled error:', error);
@@ -74,6 +92,12 @@ async function handleRequest(request, env, ctx) {
         
       case '/heartbeat':
         return handleHeartbeat(request, env);
+        
+      case '/stats':
+        return handleStats(request, env);
+        
+      case '/debug/tunnels':
+        return handleDebugTunnels(request, env);
         
       default:
         return new Response('Not Found', { 
@@ -132,8 +156,8 @@ async function handleRegister(request, env) {
       })
     });
   } catch (error) {
-    console.error('Register error:', error.message); // Don't log full error object
-    return new Response(JSON.stringify({ error: 'Registration failed' }), {
+    console.error('Register error:', error.message);
+    return new Response(JSON.stringify({ error: 'Registration failed: ' + error.message }), {
       status: 400,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
@@ -172,7 +196,7 @@ async function handleUnregister(request, env) {
     });
   } catch (error) {
     console.error('Unregister error:', error.message);
-    return new Response(JSON.stringify({ error: 'Unregistration failed' }), {
+    return new Response(JSON.stringify({ error: 'Unregistration failed: ' + error.message }), {
       status: 400,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
@@ -209,13 +233,17 @@ async function handlePoll(request, env) {
     });
   }
 
-  // Check if tunnel exists
+  // Check if tunnel exists and update polling activity
   if (!tunnelManager.isActive(tunnelId)) {
-    return new Response('Tunnel not found', { 
+    console.warn(`Poll request for inactive tunnel: ${tunnelId}`);
+    return new Response('Tunnel not found or inactive', { 
       status: 404,
       headers: addCORSHeaders({})
     });
   }
+
+  // Update polling activity
+  tunnelManager.updatePollingActivity(tunnelId);
 
   try {
     const requestData = await requestQueue.waitForRequest(tunnelId, 30000); // 30 second timeout
@@ -244,7 +272,7 @@ async function handlePoll(request, env) {
     });
   } catch (error) {
     console.error('Poll error:', error.message);
-    return new Response(JSON.stringify({ error: 'Polling failed' }), {
+    return new Response(JSON.stringify({ error: 'Polling failed: ' + error.message }), {
       status: 500,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
@@ -313,7 +341,7 @@ async function handleResponse(request, env) {
     });
   } catch (error) {
     console.error('Response error:', error.message);
-    return new Response(JSON.stringify({ error: 'Response processing failed' }), {
+    return new Response(JSON.stringify({ error: 'Response processing failed: ' + error.message }), {
       status: 400,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
@@ -361,8 +389,107 @@ async function handleHeartbeat(request, env) {
     });
   } catch (error) {
     console.error('Heartbeat error:', error.message);
-    return new Response(JSON.stringify({ error: 'Heartbeat failed' }), {
+    return new Response(JSON.stringify({ error: 'Heartbeat failed: ' + error.message }), {
       status: 400,
+      headers: addCORSHeaders({
+        'Content-Type': 'application/json'
+      })
+    });
+  }
+}
+
+/**
+ * Handles stats endpoint for monitoring
+ */
+async function handleStats(request, env) {
+  if (request.method !== 'GET') {
+    return new Response('Method Not Allowed', { 
+      status: 405,
+      headers: addCORSHeaders({})
+    });
+  }
+
+  if (!validateAuth(request, env.AUTH_KEY)) {
+    return new Response('Unauthorized', { 
+      status: 401,
+      headers: addCORSHeaders({})
+    });
+  }
+
+  try {
+    const tunnelStats = tunnelManager.getStats();
+    const queueStats = requestQueue.getStats();
+    
+    const stats = {
+      server: {
+        uptime: Date.now(),
+        version: '1.1.0',
+        environment: env.ENVIRONMENT || 'unknown'
+      },
+      tunnels: tunnelStats,
+      queues: queueStats,
+      memory: {
+        active_tunnels_count: activeTunnels.size,
+        request_queues_count: requestQueues.size,
+        pending_responses_count: pendingResponses.size
+      }
+    };
+
+    return new Response(JSON.stringify(stats, null, 2), {
+      status: 200,
+      headers: addCORSHeaders({
+        'Content-Type': 'application/json'
+      })
+    });
+  } catch (error) {
+    console.error('Stats error:', error.message);
+    return new Response(JSON.stringify({ error: 'Stats failed: ' + error.message }), {
+      status: 500,
+      headers: addCORSHeaders({
+        'Content-Type': 'application/json'
+      })
+    });
+  }
+}
+
+/**
+ * Handles debug tunnels endpoint
+ */
+async function handleDebugTunnels(request, env) {
+  if (request.method !== 'GET') {
+    return new Response('Method Not Allowed', { 
+      status: 405,
+      headers: addCORSHeaders({})
+    });
+  }
+
+  if (!validateAuth(request, env.AUTH_KEY)) {
+    return new Response('Unauthorized', { 
+      status: 401,
+      headers: addCORSHeaders({})
+    });
+  }
+
+  try {
+    const tunnels = tunnelManager.listTunnels();
+    const queues = requestQueue.listQueues();
+    
+    const debug = {
+      tunnels: tunnels,
+      queues: queues,
+      timestamp: Date.now()
+    };
+
+    return new Response(JSON.stringify(debug, null, 2), {
+      status: 200,
+      headers: addCORSHeaders({
+        'Content-Type': 'application/json'
+      })
+    });
+  } catch (error) {
+    console.error('Debug tunnels error:', error.message);
+    return new Response(JSON.stringify({ error: 'Debug failed: ' + error.message }), {
+      status: 500,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -376,7 +503,7 @@ async function handleHeartbeat(request, env) {
 async function handlePublicRequest(request, env, ctx) {
     const url = new URL(request.url);  
     // Find matching tunnel by path
-    const tunnel = await tunnelManager.findTunnelByPath(url.pathname); 
+    const tunnel = tunnelManager.findTunnelByPath(url.pathname); 
     
     if (!tunnel) {  
       return new Response('Not Found', { 
@@ -425,6 +552,7 @@ async function handlePublicRequest(request, env, ctx) {
       });
     }
   }
+
 /**
  * Serializes HTTP request for tunneling - ALL DATA AS RAW BINARY
  * @param {Request} request - HTTP request
