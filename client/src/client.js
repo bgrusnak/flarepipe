@@ -243,7 +243,7 @@ class TunnelClient {
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${this.authKey}`,
-                    'User-Agent': 'fast-tunnel-client/1.0.0'
+                    'User-Agent': 'flarepipe-client/1.0.0'
                 },
                 body: JSON.stringify({
                     forward_rules: this.forwardRules,

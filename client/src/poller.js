@@ -60,7 +60,7 @@ class Poller {
   getBaseHeaders() {
     const headers = {
       'Accept': 'application/json',
-      'User-Agent': 'fast-tunnel-client/1.0.0'
+      'User-Agent': 'flarepipe-client/1.0.0'
     };
     
     if (this.authKey) {

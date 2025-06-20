@@ -1,0 +1,51 @@
+name = "flarepipe"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat_v2"]
+
+# Worker configuration
+[env.production]
+name = "flarepipe" 
+[env.staging]
+name = "flarepipe-staging" 
+
+[env.development]
+name = "flarepipe-dev" 
+# Environment variables (set via wrangler secret or dashboard)
+# These should be set as secrets, not as plain vars for security
+# 
+# Required secrets to set:
+# wrangler secret put AUTH_KEY --env production
+# wrangler secret put PREFIX --env production
+#
+# Example values:
+# AUTH_KEY = "your-secret-auth-key-here"
+# PREFIX = ""  # Empty string for /register, or "api" for /api/register
+#
+# To set secrets:
+# wrangler secret put AUTH_KEY
+# wrangler secret put PREFIX
+ 
+
+[env.production.vars] 
+ENVIRONMENT = "production" 
+
+
+# For development, you can use vars instead of secrets
+[env.development.vars]
+AUTH_KEY = "dev-secret-key-123"
+ENVIRONMENT = "development"
+PREFIX = ""
+
+[env.staging.vars]  
+AUTH_KEY = "staging-secret-key-456"
+PREFIX = "tunnel"
+ENVIRONMENT = "staging"
+
+# Production uses secrets only (no vars for security)
+# Set via: wrangler secret put AUTH_KEY --env production
+#         wrangler secret put PREFIX --env production
+
+[observability]
+enabled = true
+head_sampling_rate = 1

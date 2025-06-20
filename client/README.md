@@ -5,12 +5,12 @@ HTTP tunnel client for exposing local servers through Cloudflare Workers. Allows
 ## Installation
 
 ```bash
-npm install -g fast-tunnel-client
+npm install -g flarepipe-client
 ```
 
 Or run directly with npx:
 ```bash
-npx fast-tunnel-client --host myhost.myname.workers.dev --forward 3000:/api
+npx flarepipe-client --host myhost.myname.workers.dev --forward 3000:/api
 ```
 
 ## Usage

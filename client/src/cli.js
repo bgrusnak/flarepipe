@@ -23,7 +23,7 @@ class CLI {
   setupCommands() {
     this.program
       .name('ft')
-      .description('Fast Tunnel - HTTP tunnel client for exposing local servers')
+      .description('Flarepipe - HTTP tunnel client for exposing local servers')
       .version('1.0.0')
       .option('-h, --host <host>', 'Upstream server providing forwarding')
       .option('-a, --auth <key>', 'Authentication key for server access')
