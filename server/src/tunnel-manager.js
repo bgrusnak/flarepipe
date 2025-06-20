@@ -19,7 +19,7 @@ export default class TunnelManager {
   }
 
   /**
-   * Registers a new tunnel
+   * Registers a new tunnel with automatic replacement of existing tunnels
    * @param {object} registrationData - Registration data from client
    * @returns {object} - Registration response
    */
@@ -37,6 +37,20 @@ export default class TunnelManager {
 
     // Validate forward rules
     const validatedRules = this.validateForwardRules(forward_rules);
+
+    // 🚀 NEW: Auto-replacement for immediate availability
+    let replacedCount = 0;
+    if (this.activeTunnels.size > 0) {
+      console.log(`Replacing ${this.activeTunnels.size} existing tunnels for immediate availability`);
+      
+      const existingTunnelIds = Array.from(this.activeTunnels.keys());
+      for (const tunnelId of existingTunnelIds) {
+        await this.cleanupTunnel(tunnelId);
+        replacedCount++;
+      }
+      
+      console.log(`✅ Replaced ${replacedCount} existing tunnels - server ready immediately`);
+    }
 
     // Generate unique tunnel ID
     const tunnelId = this.generateTunnelId();
@@ -61,13 +75,14 @@ export default class TunnelManager {
     // Store tunnel
     this.activeTunnels.set(tunnelId, tunnel);
 
-    console.log(`Tunnel registered: ${tunnelId} with ${validatedRules.length} rules`);
+    console.log(`Tunnel registered: ${tunnelId} with ${validatedRules.length} rules (replaced ${replacedCount} existing)`);
 
     return {
       tunnel_id: tunnelId,
       public_url: this.workerHost,
       rules_registered: validatedRules.length,
-      expires_in: this.tunnelTimeout
+      expires_in: this.tunnelTimeout,
+      replaced_tunnels: replacedCount // 🚀 NEW: replacement info
     };
   }
 
@@ -92,11 +107,19 @@ export default class TunnelManager {
   }
 
   /**
-   * Properly cleans up all tunnel data
+   * Enhanced cleanup with immediate effect
    * @param {string} tunnelId - Tunnel ID to clean up
    */
   async cleanupTunnel(tunnelId) {
-    // Remove tunnel from active tunnels
+    const tunnel = this.activeTunnels.get(tunnelId);
+    if (!tunnel) {
+      return; // Already cleaned up
+    }
+
+    // 🚀 NEW: Mark as inactive immediately to prevent new requests
+    tunnel.status = 'inactive';
+    
+    // Remove tunnel from active tunnels immediately
     this.activeTunnels.delete(tunnelId);
     
     // Clean up request queue if available
@@ -104,7 +127,7 @@ export default class TunnelManager {
       this.requestQueue.cancelTunnelRequests(tunnelId);
     }
     
-    console.log(`Cleaned up all data for tunnel: ${tunnelId}`);
+    console.log(`🧹 Cleaned up tunnel: ${tunnelId}`);
   }
 
   /**
@@ -121,7 +144,7 @@ export default class TunnelManager {
   }
 
   /**
-   * Finds tunnel that matches the given path
+   * Enhanced path-based tunnel finder with better performance for new tunnels
    * @param {string} requestPath - Request path to match
    * @returns {object|null} - Matching tunnel or null
    */
@@ -142,10 +165,12 @@ export default class TunnelManager {
         continue;
       }
 
-      // Check if tunnel is recently active (polled within last 2 minutes)
+      // 🚀 NEW: More lenient activity check for newly created tunnels
+      const timeSinceCreated = Date.now() - tunnel.created_at;
       const timeSinceLastPoll = Date.now() - (tunnel.last_poll || tunnel.last_seen);
-      if (timeSinceLastPoll > 2 * 60 * 1000) {
-        console.warn(`Tunnel ${tunnelId} found but hasn't polled recently (${Math.round(timeSinceLastPoll/1000)}s ago)`);
+      
+      // Allow newly created tunnels (< 30 seconds) or recently polling tunnels
+      if (timeSinceCreated > 30000 && timeSinceLastPoll > 2 * 60 * 1000) {
         continue; // Skip inactive tunnels
       }
 
@@ -195,7 +220,7 @@ export default class TunnelManager {
   }
 
   /**
-   * Checks if tunnel is active and recently polled
+   * Enhanced tunnel activity check with support for new tunnels
    * @param {string} tunnelId - Tunnel ID to check
    * @returns {boolean} - True if tunnel exists and is active
    */
@@ -205,9 +230,12 @@ export default class TunnelManager {
       return false;
     }
     
-    // Check if tunnel has polled recently
+    // 🚀 NEW: More lenient check for newly created tunnels
+    const timeSinceCreated = Date.now() - tunnel.created_at;
     const timeSinceLastPoll = Date.now() - (tunnel.last_poll || tunnel.last_seen);
-    return timeSinceLastPoll < 5 * 60 * 1000; // 5 minutes
+    
+    // Allow newly created tunnels (< 30 seconds) or recently active ones
+    return timeSinceCreated < 30000 || timeSinceLastPoll < 5 * 60 * 1000;
   }
 
   /**
@@ -250,7 +278,7 @@ export default class TunnelManager {
   }
 
   /**
-   * Removes inactive tunnels that haven't sent heartbeat or polled
+   * Enhanced cleanup with protection for new tunnels
    */
   cleanupInactiveTunnels() {
     const now = Date.now();
@@ -258,8 +286,14 @@ export default class TunnelManager {
     const warnings = [];
 
     for (const [tunnelId, tunnel] of this.activeTunnels) {
+      const timeSinceCreated = now - tunnel.created_at;
       const timeSinceLastSeen = now - tunnel.last_seen;
       const timeSinceLastPoll = now - (tunnel.last_poll || tunnel.last_seen);
+
+      // 🚀 NEW: Don't cleanup newly created tunnels
+      if (timeSinceCreated < 60000) {
+        continue; // Skip tunnels created in last minute
+      }
 
       // Mark as expired if no heartbeat for tunnel timeout period
       if (timeSinceLastSeen > this.tunnelTimeout) {
@@ -361,7 +395,7 @@ export default class TunnelManager {
   }
 
   /**
-   * Gets statistics about active tunnels
+   * Enhanced statistics with replacement information
    * @returns {object} - Tunnel statistics
    */
   getStats() {
@@ -369,6 +403,7 @@ export default class TunnelManager {
     const now = Date.now();
     let activeTunnels = 0;
     let recentlyPolled = 0;
+    let newlyCreated = 0; // 🚀 NEW
     let totalRules = 0;
     let totalPolls = 0;
 
@@ -378,7 +413,14 @@ export default class TunnelManager {
         totalRules += tunnel.forward_rules.length;
         totalPolls += tunnel.polls_count || 0;
         
+        const timeSinceCreated = now - tunnel.created_at;
         const timeSinceLastPoll = now - (tunnel.last_poll || tunnel.last_seen);
+        
+        // 🚀 NEW: Track newly created tunnels
+        if (timeSinceCreated < 60000) {
+          newlyCreated++;
+        }
+        
         if (timeSinceLastPoll < 2 * 60 * 1000) {
           recentlyPolled++;
         }
@@ -389,6 +431,7 @@ export default class TunnelManager {
       total_tunnels: totalTunnels,
       active_tunnels: activeTunnels,
       recently_polled: recentlyPolled,
+      newly_created: newlyCreated, // 🚀 NEW
       total_rules: totalRules,
       total_polls: totalPolls,
       cleanup_timeout: this.tunnelTimeout,
@@ -397,7 +440,7 @@ export default class TunnelManager {
   }
 
   /**
-   * Lists all active tunnels (for debugging)
+   * Enhanced tunnel listing with creation time info
    * @returns {Array} - Array of tunnel info
    */
   listTunnels() {
@@ -409,16 +452,18 @@ export default class TunnelManager {
         id: tunnelId,
         status: tunnel.status,
         created_at: tunnel.created_at,
+        age_seconds: Math.round((now - tunnel.created_at) / 1000), // 🚀 NEW
         last_seen: tunnel.last_seen,
         last_poll: tunnel.last_poll,
         time_since_last_poll: tunnel.last_poll ? now - tunnel.last_poll : null,
         polls_count: tunnel.polls_count || 0,
         rules_count: tunnel.forward_rules.length,
-        client_version: tunnel.client_info.version
+        client_version: tunnel.client_info.version,
+        rules: tunnel.forward_rules.map(r => `${r.port}:${r.path}`) // 🚀 NEW: show rules
       });
     }
 
-    return tunnels;
+    return tunnels.sort((a, b) => b.created_at - a.created_at); // 🚀 NEW: newest first
   }
 
   /**
