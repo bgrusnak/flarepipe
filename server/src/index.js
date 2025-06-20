@@ -349,80 +349,60 @@ async function handleHeartbeat(request, env) {
  * Handles public requests (proxy to tunnels)
  */
 async function handlePublicRequest(request, env, ctx) {
-  // Check body size limit first
-  const contentLength = request.headers.get('content-length');
-  if (contentLength && parseInt(contentLength) > 10 * 1024 * 1024) { // 10MB limit
-    return new Response('Payload Too Large', { 
-      status: 413,
-      headers: addCORSHeaders({
-        'Content-Type': 'text/plain'
-      })
-    });
-  }
-
-  let url;
-  try {
-    url = new URL(request.url);
-  } catch (error) {
-    return new Response('Bad Request', { 
-      status: 400,
-      headers: addCORSHeaders({
-        'Content-Type': 'text/plain'
-      })
-    });
-  }
-  
-  // Find matching tunnel by path
-  const tunnel = await tunnelManager.findTunnelByPath(url.pathname);
-  
-  if (!tunnel) {
-    return new Response('Not Found', { 
-      status: 404,
-      headers: addCORSHeaders({
-        'Content-Type': 'text/plain'
-      })
-    });
-  }
-
-  try {
-    // Convert request to data for tunneling
-    const requestData = await serializeRequest(request);
+    const url = new URL(request.url); 
     
-    // Queue request and wait for response
-    const response = await requestQueue.queueRequest(tunnel.id, requestData, 30000);
+    // Find matching tunnel by path
+    const tunnel = await tunnelManager.findTunnelByPath(url.pathname); 
     
-    // Build HTTP response from tunnel response with CORS
-    const httpResponse = await responseBuilder.buildResponse(response);
-    
-    // Add CORS headers to tunnel response
-    const corsHeaders = addCORSHeaders({});
-    for (const [key, value] of Object.entries(corsHeaders)) {
-      httpResponse.headers.set(key, value);
-    }
-    
-    return httpResponse;
-    
-  } catch (error) {
-    console.error('Public request error:', error);
-    
-    if (error.message === 'Request timeout') {
-      return new Response('Gateway Timeout', { 
-        status: 504,
+    if (!tunnel) { 
+      return new Response('Not Found', { 
+        status: 404,
         headers: addCORSHeaders({
           'Content-Type': 'text/plain'
         })
       });
     }
+   
     
-    return new Response('Bad Gateway', { 
-      status: 502,
-      headers: addCORSHeaders({
-        'Content-Type': 'text/plain'
-      })
-    });
+    try {
+      // Convert request to data for tunneling
+      const requestData = await serializeRequest(request);
+    
+      // Queue request and wait for response
+      const response = await requestQueue.queueRequest(tunnel.id, requestData, 30000);
+ 
+      
+      // Build HTTP response from tunnel response with CORS
+      const httpResponse = await responseBuilder.buildResponse(response);
+      
+      // Add CORS headers to tunnel response
+      const corsHeaders = addCORSHeaders({});
+      for (const [key, value] of Object.entries(corsHeaders)) {
+        httpResponse.headers.set(key, value);
+      }
+      
+      return httpResponse;
+      
+    } catch (error) {
+      console.error('❌ Public request error:', error.message);
+      
+      if (error.message === 'Request timeout') {
+        return new Response('Gateway Timeout', { 
+          status: 504,
+          headers: addCORSHeaders({
+            'Content-Type': 'text/plain'
+          })
+        });
+      }
+      
+      return new Response('Bad Gateway', { 
+        status: 502,
+        headers: addCORSHeaders({
+          'Content-Type': 'text/plain'
+        })
+      });
+    }
   }
-}
-
 /**
  * Serializes HTTP request for tunneling
  * @param {Request} request - HTTP request

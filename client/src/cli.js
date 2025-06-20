@@ -291,7 +291,7 @@ Configuration File:
    */
   displayBanner(config) {
     console.log('');
-    console.log('🚀 Fast Tunnel Client');
+    console.log('🚀 FlarePipe Client');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`📡 Tunnel Host: ${config.host}`);
     console.log(`🔑 Auth Key: ${config.auth.substring(0, 4)}***`);

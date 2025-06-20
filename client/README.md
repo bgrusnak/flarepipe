@@ -1,4 +1,4 @@
-# Fast Tunnel Client
+# FlarePipe Client
 
 HTTP tunnel client for exposing local servers through Cloudflare Workers. Allows you to make your local development servers accessible from the internet via a public URL.
 

@@ -27,10 +27,8 @@ name = "flarepipe-dev"
 # wrangler secret put PREFIX
  
 
-[env.production.vars]
-AUTH_KEY = "dev-secret-key-123"
-ENVIRONMENT = "production"
-PREFIX = "tunnel"
+[env.production.vars] 
+ENVIRONMENT = "production" 
 
 
 # For development, you can use vars instead of secrets
@@ -47,3 +45,7 @@ ENVIRONMENT = "staging"
 # Production uses secrets only (no vars for security)
 # Set via: wrangler secret put AUTH_KEY --env production
 #         wrangler secret put PREFIX --env production
+
+[observability]
+enabled = true
+head_sampling_rate = 1
