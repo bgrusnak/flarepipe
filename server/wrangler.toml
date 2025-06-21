@@ -3,14 +3,54 @@ main = "src/index.js"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat_v2"]
 
+# Durable Objects configuration
+[[durable_objects.bindings]]
+name = "TUNNEL_REGISTRY"
+class_name = "TunnelRegistry"
+
+[[durable_objects.bindings]]
+name = "REQUEST_QUEUE"
+class_name = "RequestQueue"
+
+# Migration for new Durable Objects (SQLite for free plan)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TunnelRegistry", "RequestQueue"]
+
 # Worker configuration
 [env.production]
-name = "flarepipe" 
+name = "flarepipe"
+
+[[env.production.durable_objects.bindings]]
+name = "TUNNEL_REGISTRY"
+class_name = "TunnelRegistry"
+
+[[env.production.durable_objects.bindings]]
+name = "REQUEST_QUEUE"
+class_name = "RequestQueue"
+
 [env.staging]
-name = "flarepipe-staging" 
+name = "flarepipe-staging"
+
+[[env.staging.durable_objects.bindings]]
+name = "TUNNEL_REGISTRY"
+class_name = "TunnelRegistry"
+
+[[env.staging.durable_objects.bindings]]
+name = "REQUEST_QUEUE"
+class_name = "RequestQueue"
 
 [env.development]
-name = "flarepipe-dev" 
+name = "flarepipe-dev"
+
+[[env.development.durable_objects.bindings]]
+name = "TUNNEL_REGISTRY"
+class_name = "TunnelRegistry"
+
+[[env.development.durable_objects.bindings]]
+name = "REQUEST_QUEUE"
+class_name = "RequestQueue"
+
 # Environment variables (set via wrangler secret or dashboard)
 # These should be set as secrets, not as plain vars for security
 # 
@@ -25,11 +65,9 @@ name = "flarepipe-dev"
 # To set secrets:
 # wrangler secret put AUTH_KEY
 # wrangler secret put PREFIX
- 
 
 [env.production.vars] 
 ENVIRONMENT = "production" 
-
 
 # For development, you can use vars instead of secrets
 [env.development.vars]

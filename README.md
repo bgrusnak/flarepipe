@@ -1,5 +1,9 @@
 # FlarePipe 🔥
 
+## What's new
+In the v2.0.0 Flarepipe started to using Durable Objects for the best consistency
+
+
 High-performance HTTP tunnel service built on Cloudflare Workers. Securely expose your local development servers to the internet through Cloudflare's global edge network.
 
 ## What is FlarePipe?

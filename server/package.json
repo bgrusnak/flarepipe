@@ -1,39 +1,39 @@
 {
     "name": "flarepipe-server",
-    "version": "1.1.1",
+    "version": "2.0.0",
     "description": "Cloudflare Worker server for FlarePipe HTTP tunnel service",
     "main": "src/index.js",
     "scripts": {
-      "dev": "wrangler dev --env development",
-      "deploy": "wrangler deploy --env production",
-      "deploy:staging": "wrangler deploy --env staging",
-      "deploy:dev": "wrangler deploy --env development",
-      "tail": "wrangler tail --env production",
-      "tail:dev": "wrangler tail --env development",
-      "secret:auth": "wrangler secret put AUTH_KEY --env production",
-      "secret:prefix": "wrangler secret put PREFIX --env production",
-      "secret:auth:staging": "wrangler secret put AUTH_KEY --env staging", 
-      "secret:prefix:staging": "wrangler secret put PREFIX --env staging",
-      "publish": "wrangler deploy --env production",
-      "test": "echo \"Error: no test specified\" && exit 1"
+        "dev": "wrangler dev --env development",
+        "deploy": "wrangler deploy --env production",
+        "deploy:staging": "wrangler deploy --env staging",
+        "deploy:dev": "wrangler deploy --env development",
+        "tail": "wrangler tail --env production",
+        "tail:dev": "wrangler tail --env development",
+        "secret:auth": "wrangler secret put AUTH_KEY --env production",
+        "secret:prefix": "wrangler secret put PREFIX --env production",
+        "secret:auth:staging": "wrangler secret put AUTH_KEY --env staging",
+        "secret:prefix:staging": "wrangler secret put PREFIX --env staging",
+        "publish": "wrangler deploy --env production",
+        "test": "echo \"Error: no test specified\" && exit 1"
     },
     "keywords": [
-      "cloudflare",
-      "worker",
-      "tunnel",
-      "proxy",
-      "http",
-      "ngrok",
-      "reverse-proxy",
-      "flarepipe"
+        "cloudflare",
+        "worker",
+        "tunnel",
+        "proxy",
+        "http",
+        "ngrok",
+        "reverse-proxy",
+        "flarepipe"
     ],
     "author": "Ilya A. Shlyakhovoy",
     "license": "MIT",
     "devDependencies": {
-      "wrangler": "^3.0.0"
+        "wrangler": "^3.0.0"
     },
     "dependencies": {},
     "engines": {
-      "node": ">=18.0.0"
+        "node": ">=18.0.0"
     }
-  }
+}

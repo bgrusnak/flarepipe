@@ -1,33 +1,12 @@
-// src/index.js
+// server/src/index.js
 
-import TunnelManager from './tunnel-manager.js';
-import RequestQueue from './request-queue.js';
+// Import Durable Object classes
+import { TunnelRegistry } from './durable-objects/tunnel-registry.js';
+import { RequestQueue } from './durable-objects/request-queue.js';
 import ResponseBuilder from './utils/response-builder.js';
 
-// Global storage (in-memory) - these persist across requests in the same isolate
-const activeTunnels = new Map();
-const requestQueues = new Map(); 
-const pendingResponses = new Map();
-
-// Initialize managers with proper cleanup integration
-let tunnelManager = null;
-let requestQueue = null;
-let responseBuilder = null;
-let isInitialized = false;
-
-/**
- * Initialize managers with proper cross-references
- */
-function initializeManagers() {
-  if (!isInitialized) {
-    requestQueue = new RequestQueue(requestQueues, pendingResponses);
-    tunnelManager = new TunnelManager(activeTunnels, requestQueue); // Pass requestQueue for cleanup
-    responseBuilder = new ResponseBuilder();
-    isInitialized = true;
-    
-    console.log('FlarePipe server managers initialized');
-  }
-}
+// Export Durable Object classes for Cloudflare
+export { TunnelRegistry, RequestQueue };
 
 /**
  * Main worker entry point
@@ -35,9 +14,6 @@ function initializeManagers() {
 export default {
   async fetch(request, env, ctx) {
     try {
-      // Initialize managers on first request
-      initializeManagers();
-      
       return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('Unhandled error:', error);
@@ -112,6 +88,21 @@ async function handleRequest(request, env, ctx) {
 }
 
 /**
+ * Get Durable Object instances
+ */
+function getTunnelRegistry(env) {
+  // Use single global instance for all tunnels
+  const id = env.TUNNEL_REGISTRY.idFromName('global');
+  return env.TUNNEL_REGISTRY.get(id);
+}
+
+function getRequestQueue(env) {
+  // Use single global instance for all requests
+  const id = env.REQUEST_QUEUE.idFromName('global');
+  return env.REQUEST_QUEUE.get(id);
+}
+
+/**
  * Validates auth token from request
  * @param {Request} request - HTTP request
  * @param {string} expectedAuth - Expected auth key
@@ -146,11 +137,19 @@ async function handleRegister(request, env) {
   }
 
   try {
-    const body = await request.json();
-    const result = await tunnelManager.registerTunnel(body);
-    
-    return new Response(JSON.stringify(result), {
-      status: 200,
+    const tunnelRegistry = getTunnelRegistry(env);
+    const response = await tunnelRegistry.fetch(new Request('https://dummy/register', {
+      method: 'POST',
+      body: await request.text(),
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    }));
+
+    // Add CORS headers to response
+    const responseText = await response.text();
+    return new Response(responseText, {
+      status: response.status,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -158,7 +157,7 @@ async function handleRegister(request, env) {
   } catch (error) {
     console.error('Register error:', error.message);
     return new Response(JSON.stringify({ error: 'Registration failed: ' + error.message }), {
-      status: 400,
+      status: 500,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -185,11 +184,18 @@ async function handleUnregister(request, env) {
   }
 
   try {
-    const body = await request.json();
-    await tunnelManager.unregisterTunnel(body.tunnel_id);
-    
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
+    const tunnelRegistry = getTunnelRegistry(env);
+    const response = await tunnelRegistry.fetch(new Request('https://dummy/unregister', {
+      method: 'POST',
+      body: await request.text(),
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    }));
+
+    const responseText = await response.text();
+    return new Response(responseText, {
+      status: response.status,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -197,7 +203,7 @@ async function handleUnregister(request, env) {
   } catch (error) {
     console.error('Unregister error:', error.message);
     return new Response(JSON.stringify({ error: 'Unregistration failed: ' + error.message }), {
-      status: 400,
+      status: 500,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -233,41 +239,47 @@ async function handlePoll(request, env) {
     });
   }
 
-  // Check if tunnel exists and update polling activity
-  if (!tunnelManager.isActive(tunnelId)) {
-    console.warn(`Poll request for inactive tunnel: ${tunnelId}`);
-    return new Response('Tunnel not found or inactive', { 
-      status: 404,
-      headers: addCORSHeaders({})
-    });
-  }
-
-  // Update polling activity
-  tunnelManager.updatePollingActivity(tunnelId);
-
   try {
-    const requestData = await requestQueue.waitForRequest(tunnelId, 30000); // 30 second timeout
+    // Update polling activity in tunnel registry
+    const tunnelRegistry = getTunnelRegistry(env);
     
-    if (!requestData) {
-      // No request available, return 204
+    // Call updatePollingActivity method on the DO
+    await tunnelRegistry.fetch(new Request('https://dummy/update-polling', {
+      method: 'POST',
+      body: JSON.stringify({ tunnel_id: tunnelId }),
+      headers: { 'Content-Type': 'application/json' }
+    }));
+
+    // Poll for requests from request queue
+    const requestQueue = getRequestQueue(env);
+    const pollUrl = new URL('https://dummy/poll');
+    pollUrl.searchParams.set('tunnel_id', tunnelId);
+    pollUrl.searchParams.set('timeout', '30000');
+
+    const response = await requestQueue.fetch(new Request(pollUrl.toString(), {
+      method: 'GET'
+    }));
+
+    // Forward response with CORS headers
+    if (response.status === 204) {
       return new Response(null, { 
         status: 204,
         headers: addCORSHeaders({})
       });
     }
 
-    // Send ArrayBuffer directly as body + metadata in headers
-    const headers = addCORSHeaders({
-      'X-Request-ID': requestData.id,
-      'X-Method': requestData.method,
-      'X-Path': requestData.path,
-      'X-Query': requestData.query || '',
-      'X-Headers': JSON.stringify(requestData.headers || {}),
-      'X-Timestamp': String(requestData.timestamp)
-    });
+    const responseBody = await response.arrayBuffer();
+    const headers = addCORSHeaders({});
+    
+    // Copy response headers (metadata from DO)
+    for (const [key, value] of response.headers.entries()) {
+      if (key.startsWith('x-')) {
+        headers[key] = value;
+      }
+    }
 
-    return new Response(requestData.body || new ArrayBuffer(0), {
-      status: 200,
+    return new Response(responseBody, {
+      status: response.status,
       headers: headers
     });
   } catch (error) {
@@ -282,7 +294,7 @@ async function handlePoll(request, env) {
 }
 
 /**
- * Handles response from tunnel client - RAW BINARY ArrayBuffer + metadata in headers
+ * Handles response from tunnel client
  */
 async function handleResponse(request, env) {
   if (request.method !== 'POST') {
@@ -300,41 +312,26 @@ async function handleResponse(request, env) {
   }
 
   try {
-    // Extract metadata from headers
-    const requestId = request.headers.get('X-Request-ID');
-    const tunnelId = request.headers.get('X-Tunnel-ID');
-    const responseStatus = request.headers.get('X-Response-Status');
-    const responseHeadersJson = request.headers.get('X-Response-Headers');
+    const requestQueue = getRequestQueue(env);
     
-    if (!requestId) {
-      return new Response('Missing X-Request-ID header', { 
-        status: 400,
-        headers: addCORSHeaders({})
-      });
-    }
-
-    // Parse response headers
-    let responseHeaders = {};
-    if (responseHeadersJson) {
-      try {
-        responseHeaders = JSON.parse(responseHeadersJson);
-      } catch (parseError) {
-        console.warn('Failed to parse response headers:', parseError.message);
+    // Forward request to request queue
+    const forwardRequest = new Request('https://dummy/response', {
+      method: 'POST',
+      body: await request.arrayBuffer(),
+      headers: {
+        'X-Request-ID': request.headers.get('X-Request-ID'),
+        'X-Tunnel-ID': request.headers.get('X-Tunnel-ID'),
+        'X-Response-Status': request.headers.get('X-Response-Status'),
+        'X-Response-Headers': request.headers.get('X-Response-Headers'),
+        'Content-Type': 'application/octet-stream'
       }
-    }
-
-    // Get RAW BINARY body as ArrayBuffer
-    const body = await request.arrayBuffer();
-
-    // Resolve request with ArrayBuffer response
-    await requestQueue.resolveRequest(requestId, {
-      status: parseInt(responseStatus, 10) || 200,
-      headers: responseHeaders,
-      body: body // ArrayBuffer - RAW BINARY
     });
 
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
+    const response = await requestQueue.fetch(forwardRequest);
+    const responseText = await response.text();
+    
+    return new Response(responseText, {
+      status: response.status,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -342,7 +339,7 @@ async function handleResponse(request, env) {
   } catch (error) {
     console.error('Response error:', error.message);
     return new Response(JSON.stringify({ error: 'Response processing failed: ' + error.message }), {
-      status: 400,
+      status: 500,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -369,20 +366,18 @@ async function handleHeartbeat(request, env) {
   }
 
   try {
-    const body = await request.json();
-    const { tunnel_id } = body;
-    
-    if (!tunnel_id) {
-      return new Response('Missing tunnel_id', { 
-        status: 400,
-        headers: addCORSHeaders({})
-      });
-    }
+    const tunnelRegistry = getTunnelRegistry(env);
+    const response = await tunnelRegistry.fetch(new Request('https://dummy/heartbeat', {
+      method: 'POST',
+      body: await request.text(),
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    }));
 
-    tunnelManager.updateHeartbeat(tunnel_id);
-
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
+    const responseText = await response.text();
+    return new Response(responseText, {
+      status: response.status,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -390,7 +385,7 @@ async function handleHeartbeat(request, env) {
   } catch (error) {
     console.error('Heartbeat error:', error.message);
     return new Response(JSON.stringify({ error: 'Heartbeat failed: ' + error.message }), {
-      status: 400,
+      status: 500,
       headers: addCORSHeaders({
         'Content-Type': 'application/json'
       })
@@ -417,22 +412,26 @@ async function handleStats(request, env) {
   }
 
   try {
-    const tunnelStats = tunnelManager.getStats();
-    const queueStats = requestQueue.getStats();
+    const tunnelRegistry = getTunnelRegistry(env);
+    const requestQueue = getRequestQueue(env);
+    
+    const [tunnelResponse, queueResponse] = await Promise.all([
+      tunnelRegistry.fetch(new Request('https://dummy/stats')),
+      requestQueue.fetch(new Request('https://dummy/stats'))
+    ]);
+
+    const tunnelStats = await tunnelResponse.json();
+    const queueStats = await queueResponse.json();
     
     const stats = {
       server: {
         uptime: Date.now(),
-        version: '1.1.0',
-        environment: env.ENVIRONMENT || 'unknown'
+        version: '1.2.0',
+        environment: env.ENVIRONMENT || 'unknown',
+        durable_objects: true
       },
       tunnels: tunnelStats,
-      queues: queueStats,
-      memory: {
-        active_tunnels_count: activeTunnels.size,
-        request_queues_count: requestQueues.size,
-        pending_responses_count: pendingResponses.size
-      }
+      queues: queueStats
     };
 
     return new Response(JSON.stringify(stats, null, 2), {
@@ -471,13 +470,26 @@ async function handleDebugTunnels(request, env) {
   }
 
   try {
-    const tunnels = tunnelManager.listTunnels();
-    const queues = requestQueue.listQueues();
+    const tunnelRegistry = getTunnelRegistry(env);
+    const requestQueue = getRequestQueue(env);
+    
+    const [tunnelsResponse, queuesResponse] = await Promise.all([
+      tunnelRegistry.fetch(new Request('https://dummy/list-tunnels')),
+      requestQueue.fetch(new Request('https://dummy/stats'))
+    ]);
+    
+    const tunnels = await tunnelsResponse.json();
+    const queueStats = await queuesResponse.json();
     
     const debug = {
       tunnels: tunnels,
-      queues: queues,
-      timestamp: Date.now()
+      queues: {
+        total_queued: queueStats.total_queued || 0,
+        total_pending: queueStats.total_pending || 0,
+        active_queues: queueStats.active_queues || 0
+      },
+      timestamp: Date.now(),
+      durable_objects: true
     };
 
     return new Response(JSON.stringify(debug, null, 2), {
@@ -501,11 +513,17 @@ async function handleDebugTunnels(request, env) {
  * Handles public requests (proxy to tunnels)
  */
 async function handlePublicRequest(request, env, ctx) {
-    const url = new URL(request.url);  
-    // Find matching tunnel by path
-    const tunnel = tunnelManager.findTunnelByPath(url.pathname); 
+  const url = new URL(request.url);
+  
+  try {
+    // Find matching tunnel
+    const tunnelRegistry = getTunnelRegistry(env);
+    const findUrl = new URL('https://dummy/find-tunnel');
+    findUrl.searchParams.set('path', url.pathname);
     
-    if (!tunnel) {  
+    const tunnelResponse = await tunnelRegistry.fetch(new Request(findUrl.toString()));
+    
+    if (tunnelResponse.status === 404) {
       return new Response('Not Found', { 
         status: 404,
         headers: addCORSHeaders({
@@ -513,45 +531,101 @@ async function handlePublicRequest(request, env, ctx) {
         })
       });
     }
-     
-    try {
-      // Convert request to data for tunneling 
-      const requestData = await serializeRequest(request); 
-      // Queue request and wait for response 
-      const response = await requestQueue.queueRequest(tunnel.id, requestData, 30000); 
-      
-      // Build HTTP response from tunnel response with CORS
-      const httpResponse = await responseBuilder.buildResponse(response);
-      
-      // Add CORS headers to tunnel response
-      const corsHeaders = addCORSHeaders({});
-      for (const [key, value] of Object.entries(corsHeaders)) {
-        httpResponse.headers.set(key, value);
+
+    if (!tunnelResponse.ok) {
+      throw new Error(`Tunnel lookup failed: ${tunnelResponse.status}`);
+    }
+
+    const tunnelInfo = await tunnelResponse.json();
+    const { tunnel_id } = tunnelInfo;
+
+    // Serialize request for tunneling
+    const requestData = await serializeRequest(request);
+    
+    // Queue request and wait for response
+    const requestQueue = getRequestQueue(env);
+    const queueResponse = await requestQueue.fetch(new Request('https://dummy/queue', {
+      method: 'POST',
+      body: requestData.body,
+      headers: {
+        'X-Tunnel-ID': tunnel_id,
+        'X-Request-ID': requestData.id,
+        'X-Method': requestData.method,
+        'X-Path': requestData.path,
+        'X-Query': requestData.query,
+        'X-Headers': JSON.stringify(requestData.headers),
+        'X-Timeout': '30000',
+        'Content-Type': 'application/octet-stream'
       }
-      
-      return httpResponse;
-      
-    } catch (error) {
-      console.error('❌ Public request error:', error.message);
-      console.error('❌ Error stack:', error.stack);
-      
-      if (error.message === 'Request timeout') {
-        return new Response('Gateway Timeout', { 
-          status: 504,
-          headers: addCORSHeaders({
-            'Content-Type': 'text/plain'
-          })
-        });
+    }));
+
+    if (!queueResponse.ok) {
+      const errorData = await queueResponse.text();
+      let errorMessage = 'Queue request failed';
+      try {
+        const parsed = JSON.parse(errorData);
+        errorMessage = parsed.error || errorMessage;
+      } catch (e) {
+        // Use default message
       }
-      
-      return new Response('Bad Gateway', { 
-        status: 502,
+      throw new Error(errorMessage);
+    }
+
+    // Extract response data from queue response
+    const responseStatus = parseInt(queueResponse.headers.get('X-Response-Status') || '200', 10);
+    const responseHeadersJson = queueResponse.headers.get('X-Response-Headers');
+    const responseBody = await queueResponse.arrayBuffer();
+
+    // Parse response headers
+    let responseHeaders = {};
+    if (responseHeadersJson) {
+      try {
+        responseHeaders = JSON.parse(responseHeadersJson);
+      } catch (e) {
+        console.warn('Failed to parse response headers:', e.message);
+      }
+    }
+
+    // Build final response using ResponseBuilder
+    const responseBuilder = new ResponseBuilder();
+    const finalResponse = await responseBuilder.buildResponse({
+      status: responseStatus,
+      headers: responseHeaders,
+      body: responseBody
+    });
+
+    return finalResponse;
+    
+  } catch (error) {
+    console.error('❌ Public request error:', error.message);
+    console.error('❌ Error stack:', error.stack);
+    
+    if (error.message.includes('timeout') || error.message.includes('Request timeout')) {
+      return new Response('Gateway Timeout', { 
+        status: 504,
         headers: addCORSHeaders({
           'Content-Type': 'text/plain'
         })
       });
     }
+    
+    if (error.message.includes('queue is full') || error.message.includes('overloaded')) {
+      return new Response('Service Temporarily Unavailable', { 
+        status: 503,
+        headers: addCORSHeaders({
+          'Content-Type': 'text/plain'
+        })
+      });
+    }
+    
+    return new Response('Bad Gateway', { 
+      status: 502,
+      headers: addCORSHeaders({
+        'Content-Type': 'text/plain'
+      })
+    });
   }
+}
 
 /**
  * Serializes HTTP request for tunneling - ALL DATA AS RAW BINARY
@@ -585,6 +659,7 @@ async function serializeRequest(request) {
         throw error;
       }
       // Ignore other body read errors, use empty ArrayBuffer
+      console.warn('Failed to read request body:', error.message);
     }
   }
 

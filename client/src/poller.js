@@ -1,4 +1,4 @@
-// src/poller.js
+// client/src/poller.js
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -27,6 +27,7 @@ class Poller {
     this.tunnelId = null;
     this.heartbeatTimer = null;
     this.lastHeartbeat = null;
+    this.client = null; // NEW: For auto-reconnect
   }
 
   /**
@@ -54,13 +55,21 @@ class Poller {
   }
 
   /**
+   * Set client reference for auto-reconnection
+   * @param {TunnelClient} client - Client instance
+   */
+  setClient(client) {
+    this.client = client;
+  }
+
+  /**
    * Gets base headers for server requests
    * @returns {object} - Headers object
    */
   getBaseHeaders() {
     const headers = {
       'Accept': 'application/json',
-      'User-Agent': 'flarepipe-client/1.0.0'
+      'User-Agent': 'flarepipe-client/1.2.0'
     };
     
     if (this.authKey) {
@@ -184,26 +193,54 @@ class Poller {
   }
 
   /**
-   * Creates a single polling worker
-   * @param {number} workerId - Worker identifier
-   * @returns {Promise} - Worker promise
+   * Enhanced polling with auto-reconnect for Durable Objects
    */
   async createPollingWorker(workerId) {
     let currentRetryDelay = this.retryDelay;
+    let consecutiveErrors = 0;
+    const maxConsecutiveErrors = 5;
 
     while (this.isRunning) {
       try {
         await this.pollOnce();
-        // Reset retry delay on successful poll
+        // Reset retry delay and error count on successful poll
         currentRetryDelay = this.retryDelay;
+        consecutiveErrors = 0;
       } catch (error) {
         if (!this.isRunning) {
           break;
         }
 
+        consecutiveErrors++;
+
         // Don't log abort errors
         if (error.name !== 'AbortError') {
-          console.error(`Poller worker ${workerId} error:`, error.message);
+          console.error(`Poller worker ${workerId} error (${consecutiveErrors}/${maxConsecutiveErrors}):`, error.message);
+        }
+
+        // Handle specific errors
+        if (error.message.includes('404') || error.message.includes('Tunnel not found')) {
+          console.log('🔄 Tunnel lost, attempting to re-register...');
+          try {
+            await this.handleTunnelLost();
+            consecutiveErrors = 0; // Reset on successful re-registration
+            continue;
+          } catch (reregisterError) {
+            console.error('Failed to re-register tunnel:', reregisterError.message);
+          }
+        }
+
+        // If too many consecutive errors, try to reconnect
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          console.warn(`Too many consecutive errors (${consecutiveErrors}), attempting full reconnect...`);
+          try {
+            await this.handleFullReconnect();
+            consecutiveErrors = 0;
+            currentRetryDelay = this.retryDelay;
+            continue;
+          } catch (reconnectError) {
+            console.error('Full reconnect failed:', reconnectError.message);
+          }
         }
         
         // Exponential backoff with jitter
@@ -215,7 +252,61 @@ class Poller {
   }
 
   /**
-   * Performs a single poll request
+   * Handle tunnel lost scenario (404 errors)
+   */
+  async handleTunnelLost() {
+    if (!this.client) {
+      throw new Error('No client reference available for re-registration');
+    }
+
+    console.log('🔄 Re-registering tunnel after loss...');
+    
+    // Re-register tunnel
+    await this.client.registerTunnel();
+    
+    // Update tunnel ID
+    this.setTunnelId(this.client.tunnelId);
+    
+    console.log(`✅ Tunnel re-registered with new ID: ${this.client.tunnelId}`);
+  }
+
+  /**
+   * Handle full reconnection (multiple errors)
+   */
+  async handleFullReconnect() {
+    if (!this.client) {
+      throw new Error('No client reference available for reconnection');
+    }
+
+    console.log('🔄 Performing full reconnect...');
+    
+    try {
+      // Stop current operations
+      const oldTunnelId = this.tunnelId;
+      
+      // Try to unregister old tunnel (best effort)
+      if (oldTunnelId) {
+        try {
+          await this.client.unregisterTunnel();
+        } catch (error) {
+          console.warn('Failed to unregister old tunnel:', error.message);
+        }
+      }
+      
+      // Re-register with new tunnel
+      await this.client.registerTunnel();
+      this.setTunnelId(this.client.tunnelId);
+      
+      console.log(`✅ Full reconnect completed with new tunnel: ${this.client.tunnelId}`);
+      
+    } catch (error) {
+      console.error('Full reconnect failed:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Enhanced pollOnce with better error handling
    */
   async pollOnce() {
     const controller = new AbortController();
@@ -230,15 +321,21 @@ class Poller {
         headers: this.getBaseHeaders()
       });
 
+      // Handle specific HTTP error codes
+      if (response.status === 404) {
+        throw new Error('Tunnel not found (404) - tunnel may have expired');
+      }
+
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('Authentication failed - check auth key');
+      }
+
       if (response.status === 204) {
         // No requests available, continue polling
         return;
       }
 
       if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
-          throw new Error(`Authentication failed during polling`);
-        }
         throw new Error(`Poll request failed: ${response.status} ${response.statusText}`);
       }
 
@@ -406,7 +503,9 @@ class Poller {
       tunnelId: this.tunnelId,
       concurrency: this.concurrency,
       lastHeartbeat: this.lastHeartbeat,
-      heartbeatHealthy: this.lastHeartbeat && (Date.now() - this.lastHeartbeat) < this.heartbeatInterval * 2
+      heartbeatHealthy: this.lastHeartbeat && (Date.now() - this.lastHeartbeat) < this.heartbeatInterval * 2,
+      authKeySet: !!this.authKey,
+      version: '1.2.0'
     };
   }
 }

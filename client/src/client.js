@@ -1,4 +1,4 @@
-// src/client.js
+// client/src/client.js
 
 const Poller = require('./poller');
 const WorkerPool = require('./worker-pool');
@@ -184,7 +184,7 @@ class TunnelClient {
     }
 
     /**
-     * Initializes all client components
+     * Initializes all client components with enhanced error handling
      */
     async initializeComponents() {
         // Create route matcher
@@ -197,25 +197,28 @@ class TunnelClient {
             enableBackpressure: true
         });
 
-        // Create poller
+        // Create poller with enhanced configuration
         this.poller = new Poller(this.host, {
             concurrency: Math.min(this.concurrency, 8), // Limit polling connections
             timeout: 30000,
             maxRequestSize: this.maxRequestSize,
             authKey: this.authKey,
-            prefix: this.prefix
+            prefix: this.prefix,
+            retryDelay: 1000,
+            maxRetryDelay: 30000
         });
 
         // Set up poller dependencies
         this.poller.setWorkerPool(this.workerPool);
         this.poller.setRequestHandler(this.handleRequest.bind(this));
+        this.poller.setClient(this); // NEW: For auto-reconnect
     }
 
     /**
-   * Builds API URL with prefix support
-   * @param {string} endpoint - API endpoint
-   * @returns {string} - Full API URL
-   */
+     * Builds API URL with prefix support
+     * @param {string} endpoint - API endpoint
+     * @returns {string} - Full API URL
+     */
     buildApiUrl(endpoint) {
         if (this.prefix) {
             const cleanPrefix = this.prefix.replace(/^\/+|\/+$/g, '');
@@ -225,42 +228,62 @@ class TunnelClient {
     }
 
     /**
-     * Registers tunnel with the server
+     * Enhanced tunnel registration with better error handling
      */
     async registerTunnel() {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // Increased timeout
 
         try {
+            console.info('Registering tunnel with server...');
+            
             const response = await fetch(this.buildApiUrl('register'), {
                 method: 'POST',
                 signal: controller.signal,
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${this.authKey}`,
-                    'User-Agent': 'flarepipe-client/1.0.0'
+                    'User-Agent': 'flarepipe-client/1.2.0'
                 },
                 body: JSON.stringify({
                     forward_rules: this.forwardRules,
                     client_info: {
-                        version: '1.0.0',
+                        version: '1.2.0',
                         concurrency: this.concurrency,
                         local_host: this.localHost,
                         features: {
                             raw_binary: true,
                             chunked_transfer: true,
                             max_request_size: this.maxRequestSize,
-                            max_response_size: this.maxResponseSize
+                            max_response_size: this.maxResponseSize,
+                            durable_objects: true // NEW: Indicate DO support
                         }
                     }
                 })
             });
 
             if (!response.ok) {
+                const errorText = await response.text();
+                
                 if (response.status === 401 || response.status === 403) {
                     throw new Error(`Authentication failed: Invalid auth key`);
                 }
-                throw new Error(`Registration failed: ${response.status} ${response.statusText}`);
+                
+                if (response.status === 429) {
+                    throw new Error(`Server overloaded: Too many tunnels. Try again later.`);
+                }
+                
+                let errorMessage = `Registration failed: ${response.status} ${response.statusText}`;
+                try {
+                    const errorData = JSON.parse(errorText);
+                    if (errorData.error) {
+                        errorMessage = errorData.error;
+                    }
+                } catch (e) {
+                    // Use default error message
+                }
+                
+                throw new Error(errorMessage);
             }
 
             const data = await response.json();
@@ -272,22 +295,33 @@ class TunnelClient {
             this.tunnelId = data.tunnel_id;
             this.poller.setTunnelId(this.tunnelId);
 
-            console.info(`Tunnel registered with ID: ${this.tunnelId}`);
-
-            if (data.public_url) {
-                console.info(`Public URL: ${data.public_url}`);
+            console.info(`✅ Tunnel registered successfully:`);
+            console.info(`   Tunnel ID: ${this.tunnelId}`);
+            console.info(`   Rules: ${data.rules_registered} forwarding rules`);
+            console.info(`   Expires: ${Math.round(data.expires_in / 1000 / 60)} minutes`);
+            
+            if (data.replaced_tunnels > 0) {
+                console.info(`   Replaced: ${data.replaced_tunnels} existing tunnels`);
             }
 
+            if (data.public_url) {
+                console.info(`   Public URL: ${data.public_url}`);
+            }
+
+        } catch (error) {
+            console.error('Failed to register tunnel:', error.message);
+            throw error;
         } finally {
             clearTimeout(timeoutId);
         }
     }
 
     /**
-     * Unregisters tunnel from the server
+     * Enhanced unregistration with proper error handling
      */
     async unregisterTunnel() {
         if (!this.tunnelId) {
+            console.info('No active tunnel to unregister');
             return;
         }
 
@@ -295,12 +329,15 @@ class TunnelClient {
         const timeoutId = setTimeout(() => controller.abort(), 5000);
 
         try {
-            const response = fetch(this.buildApiUrl('unregister'), {
+            console.info(`Unregistering tunnel: ${this.tunnelId}`);
+            
+            const response = await fetch(this.buildApiUrl('unregister'), {
                 method: 'POST',
                 signal: controller.signal,
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.authKey}`
+                    'Authorization': `Bearer ${this.authKey}`,
+                    'User-Agent': 'flarepipe-client/1.2.0'
                 },
                 body: JSON.stringify({
                     tunnel_id: this.tunnelId
@@ -308,21 +345,22 @@ class TunnelClient {
             });
 
             if (response.ok) {
-                console.info('Tunnel unregistered successfully');
+                console.info('✅ Tunnel unregistered successfully');
             } else {
-                console.warn(`Failed to unregister tunnel: ${response.status}`);
+                const errorText = await response.text();
+                console.warn(`Failed to unregister tunnel: ${response.status} - ${errorText}`);
             }
         } catch (error) {
-            console.warn('Error unregistering tunnel:', error.message);
+            if (error.name !== 'AbortError') {
+                console.warn('Error unregistering tunnel:', error.message);
+            }
         } finally {
             clearTimeout(timeoutId);
         }
     }
 
     /**
-     * Handles incoming HTTP request from the server
-     * @param {object} requestData - Request data from poller
-     * @returns {object} - Response data
+     * Enhanced error handling for requests
      */
     async handleRequest(requestData) {
         this.stats.requestsProcessed++;
@@ -331,10 +369,16 @@ class TunnelClient {
         const startTime = Date.now();
 
         try {
+            // Validate request data
+            if (!requestData || !requestData.id || !requestData.method || !requestData.path) {
+                throw new Error('Invalid request data received');
+            }
+
             // Find matching route
             const route = this.routeMatcher.match(requestData.path);
             if (!route) {
-                return this.createErrorResponse(404, 'Not Found', 'No matching route found');
+                return this.createErrorResponse(404, 'Not Found', 
+                    `No forwarding rule matches path: ${requestData.path}`);
             }
 
             // Check request size limits
@@ -345,6 +389,9 @@ class TunnelClient {
                     `Request body too large: ${bodySize} bytes (max: ${this.maxRequestSize})`);
             }
 
+            // Log request
+            console.info(`📨 ${requestData.method} ${requestData.path} → localhost:${route.port}`);
+
             // Proxy request to local server
             const response = await this.proxyToLocal(requestData, route);
 
@@ -352,7 +399,7 @@ class TunnelClient {
             this.stats.bytesTransferred += (response.body ? response.body.byteLength : 0);
 
             const duration = Date.now() - startTime;
-            console.info(`${requestData.method} ${requestData.path} -> ${route.port} (${response.status}) ${duration}ms`);
+            console.info(`✅ ${requestData.method} ${requestData.path} → ${route.port} (${response.status}) ${duration}ms`);
 
             return response;
 
@@ -360,7 +407,23 @@ class TunnelClient {
             this.stats.requestsFailed++;
             const duration = Date.now() - startTime;
 
-            console.error(`${requestData.method} ${requestData.path} failed after ${duration}ms:`, error.message);
+            console.error(`❌ ${requestData.method} ${requestData.path} failed after ${duration}ms:`, error.message);
+
+            // Provide helpful error messages
+            if (error.message.includes('ECONNREFUSED')) {
+                return this.createErrorResponse(503, 'Service Unavailable',
+                    `Cannot connect to localhost:${route?.port}. Is your development server running?`);
+            }
+
+            if (error.message.includes('ENOTFOUND')) {
+                return this.createErrorResponse(502, 'Bad Gateway',
+                    `Cannot resolve localhost. Check your network configuration.`);
+            }
+
+            if (error.message.includes('timeout')) {
+                return this.createErrorResponse(504, 'Gateway Timeout',
+                    `Local server took too long to respond (>${this.requestTimeout}ms).`);
+            }
 
             return this.createErrorResponse(
                 error.status || 500,
@@ -420,7 +483,7 @@ class TunnelClient {
         throw new Error(`Failed after ${this.retryAttempts} attempts: ${lastError.message}`);
     }
     
-   /**
+    /**
      * Performs single HTTP request with timeout handling
      * @param {string} url - Target URL
      * @param {object} requestData - Request data
@@ -428,54 +491,54 @@ class TunnelClient {
      * @param {AbortController} controller - Abort controller
      * @returns {object} - Response data with ArrayBuffer body
      */
-   async performRequest(url, requestData, route, controller) {
-    // Overall timeout for the entire operation
-    const overallTimeoutId = setTimeout(() => {
-        controller.abort();
-    }, this.requestTimeout);
+    async performRequest(url, requestData, route, controller) {
+        // Overall timeout for the entire operation
+        const overallTimeoutId = setTimeout(() => {
+            controller.abort();
+        }, this.requestTimeout);
 
-    try {
-        // Prepare headers
-        const headers = { ...requestData.headers };
+        try {
+            // Prepare headers
+            const headers = { ...requestData.headers };
 
-        // Set Host header appropriately for virtual hosts (case-insensitive check)
-        const hostHeaderKey = Object.keys(requestData.headers).find(key =>
-            key.toLowerCase() === 'host'
-        );
-        const hostHeaderValue = hostHeaderKey ? requestData.headers[hostHeaderKey] : null;
+            // Set Host header appropriately for virtual hosts (case-insensitive check)
+            const hostHeaderKey = Object.keys(requestData.headers).find(key =>
+                key.toLowerCase() === 'host'
+            );
+            const hostHeaderValue = hostHeaderKey ? requestData.headers[hostHeaderKey] : null;
 
-        if (hostHeaderValue) {
-            headers['Host'] = hostHeaderValue;
-        } else {
-            headers['Host'] = `${this.localHost}:${route.port}`;
+            if (hostHeaderValue) {
+                headers['Host'] = hostHeaderValue;
+            } else {
+                headers['Host'] = `${this.localHost}:${route.port}`;
+            }
+
+            // Remove problematic headers that fetch will handle
+            delete headers['content-length'];
+            delete headers['connection'];
+            delete headers['transfer-encoding'];
+
+            // Prepare fetch options
+            const fetchOptions = {
+                method: requestData.method,
+                signal: controller.signal,
+                headers: headers
+            };
+
+            // Only add body for methods that support it
+            if (requestData.method !== 'GET' && requestData.method !== 'HEAD') {
+                fetchOptions.body = requestData.body;
+            }
+
+            const response = await fetch(url, fetchOptions);
+
+            // Process response - ALL DATA AS RAW BINARY (ArrayBuffer)
+            return await this.processResponse(response);
+
+        } finally {
+            clearTimeout(overallTimeoutId);
         }
-
-        // Remove problematic headers that fetch will handle
-        delete headers['content-length'];
-        delete headers['connection'];
-        delete headers['transfer-encoding'];
-
-        // Prepare fetch options
-        const fetchOptions = {
-            method: requestData.method,
-            signal: controller.signal,
-            headers: headers
-        };
-
-        // Only add body for methods that support it
-        if (requestData.method !== 'GET' && requestData.method !== 'HEAD') {
-            fetchOptions.body = requestData.body;
-        }
-
-        const response = await fetch(url, fetchOptions);
-
-        // Process response - ALL DATA AS RAW BINARY (ArrayBuffer)
-        return await this.processResponse(response);
-
-    } finally {
-        clearTimeout(overallTimeoutId);
     }
-}
 
     /**
      * Processes response and returns RAW BINARY data as ArrayBuffer
@@ -565,8 +628,7 @@ class TunnelClient {
     }
 
     /**
-     * Gets current client status
-     * @returns {object} - Status information
+     * Enhanced status display
      */
     getStatus() {
         const uptime = this.stats.startTime ? Date.now() - this.stats.startTime : 0;
@@ -578,11 +640,15 @@ class TunnelClient {
             host: this.host,
             forwardRules: this.forwardRules,
             uptime: uptime,
+            version: '1.2.0',
+            durableObjects: true, // NEW: Indicate DO support
             stats: {
                 ...this.stats,
                 requestRate: `${requestRate} req/s`,
                 successRate: this.stats.requestsProcessed > 0 ?
-                    `${((this.stats.requestsSucceeded / this.stats.requestsProcessed) * 100).toFixed(1)}%` : '0%'
+                    `${((this.stats.requestsSucceeded / this.stats.requestsProcessed) * 100).toFixed(1)}%` : '0%',
+                avgResponseTime: this.stats.requestsProcessed > 0 ?
+                    `${Math.round((Date.now() - this.stats.startTime) / this.stats.requestsProcessed)}ms` : '0ms'
             },
             poller: this.poller ? this.poller.getStatus() : null,
             workerPool: this.workerPool ? this.workerPool.getStatus() : null

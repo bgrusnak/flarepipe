@@ -1,4 +1,4 @@
-// src/utils/response-builder.js
+// server/src/utils/response-builder.js
 
 export default class ResponseBuilder {
   /**
@@ -7,7 +7,7 @@ export default class ResponseBuilder {
   constructor() {
     this.maxResponseSize = 50 * 1024 * 1024; // 50MB limit for CF Worker
     this.defaultHeaders = {
-      'X-Tunnel-Proxy': 'flarepipe-server/1.0.0'
+      'X-Tunnel-Proxy': 'flarepipe-server/1.2.0'
     };
     
     // Feature detection
@@ -109,10 +109,13 @@ export default class ResponseBuilder {
       }
     }
     
+    // Add CORS headers
+    for (const [key, value] of Object.entries(this.getCORSHeaders())) {
+      processedHeaders.set(key, value);
+    }
+    
     return processedHeaders;
   }
-
-
 
   /**
    * Checks if header is valid
@@ -233,6 +236,11 @@ export default class ResponseBuilder {
       headers.set(key, value);
     }
     
+    // Add CORS headers
+    for (const [key, value] of Object.entries(this.getCORSHeaders())) {
+      headers.set(key, value);
+    }
+    
     return new Response(message, {
       status: status,
       statusText: this.getStatusText(status),
@@ -275,5 +283,17 @@ export default class ResponseBuilder {
       }
       this.defaultHeaders = { ...this.defaultHeaders, ...validHeaders };
     }
+  }
+
+  /**
+   * Get CORS headers
+   * @returns {object} - CORS headers
+   */
+  getCORSHeaders() {
+    return {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+    };
   }
 }
