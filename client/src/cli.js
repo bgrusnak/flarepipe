@@ -327,7 +327,7 @@ Configuration File:
     try {
       // Create and configure client
       this.client = new TunnelClient({
-        requestTimeout: 30000,
+        requestTimeout: 60000,
         maxRequestSize: 10 * 1024 * 1024, // 10MB
         retryAttempts: 3,
         enableCompression: true

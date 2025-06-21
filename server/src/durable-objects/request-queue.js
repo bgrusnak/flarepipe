@@ -13,8 +13,8 @@ export class RequestQueue {
       
       // Configuration
       this.maxQueueSize = 100;
-      this.requestTimeout = 30000; // 30 seconds
-      this.pollTimeout = 30000; // 30 seconds
+      this.requestTimeout = 60000; // 30 seconds
+      this.pollTimeout = 60000; // 30 seconds
       this.maxRequestSize = 10 * 1024 * 1024; // 10MB
       
       this.initialized = false;

@@ -27,7 +27,7 @@ class TunnelClient {
         this.routeMatcher = null;
 
         // Configuration
-        this.requestTimeout = options.requestTimeout || 30000; // 30 seconds
+        this.requestTimeout = options.requestTimeout || 60000; // 30 seconds
         this.maxRequestSize = options.maxRequestSize || 10 * 1024 * 1024; // 10MB
         this.maxResponseSize = options.maxResponseSize || 100 * 1024 * 1024; // 100MB max
         this.retryAttempts = options.retryAttempts || 3;
