@@ -24,7 +24,7 @@ class CLI {
     this.program
       .name('ft')
       .description('Flarepipe - HTTP tunnel client for exposing local servers')
-      .version('2.0.2')
+      .version('2.0.3')
       .option('-h, --host <host>', 'Upstream server providing forwarding')
       .option('-a, --auth <key>', 'Authentication key for server access')
       .option('-f, --forward <rule>', 'Port forwarding rule: "PORT:PATH" or "PORT" for root', this.collectForwardRules, [])
@@ -327,9 +327,9 @@ Configuration File:
     try {
       // Create and configure client
       this.client = new TunnelClient({
-        requestTimeout: 60000,
+        requestTimeout: 120000,
         maxRequestSize: 10 * 1024 * 1024, // 10MB
-        retryAttempts: 3,
+        retryAttempts: 9,
         enableCompression: true
       });
 

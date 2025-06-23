@@ -1,6 +1,6 @@
 {
   "name": "flarepipe-client",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "HTTP tunnel client for exposing local servers through Cloudflare Workers",
   "main": "lib/index.js",
   "bin": {
