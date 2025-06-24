@@ -1,218 +1,254 @@
+// client/src/worker-pool-optimized.js - Оптимизированная версия с агрессивными лимитами
+
 class WorkerPool {
-    /**
-     * Creates a new worker pool
-     * @param {number} maxConcurrency - Maximum number of concurrent workers
-     * @param {object} options - Additional options
-     */
-    constructor(maxConcurrency = 16, options = {}) {
-      this.maxWorkers = maxConcurrency;
+  constructor(maxConcurrency = 8, options = {}) {
+      this.maxWorkers = Math.min(maxConcurrency, 12); // Жесткий лимит в 12 воркеров
       this.activeWorkers = 0;
-      this.priorityQueues = new Map(); // Priority -> tasks array
-      this.totalQueuedTasks = 0; // Cache for performance
-      this.maxQueueSize = options.maxQueueSize || 1000;
-      this.taskTimeout = options.taskTimeout || 5 * 60 * 1000; // 5 minutes
-      this.enableBackpressure = options.enableBackpressure !== false;
-      this.backpressureThreshold = options.backpressureThreshold || 0.8;
+      this.priorityQueues = new Map();
+      this.totalQueuedTasks = 0;
       
-      // Graceful degradation
-      this.errorWindow = options.errorWindow || 60000; // 1 minute
-      this.maxErrorsPerWindow = options.maxErrorsPerWindow || 10;
-      this.degradationFactor = options.degradationFactor || 0.5;
+      // Агрессивно уменьшенные лимиты
+      this.maxQueueSize = options.maxQueueSize || Math.max(this.maxWorkers * 2, 8);
+      this.taskTimeout = options.taskTimeout || 30000; // 30 секунд
+      this.enableBackpressure = options.enableBackpressure !== false;
+      this.backpressureThreshold = options.backpressureThreshold || 0.6; // Более агрессивный
+      
+      // Агрессивная деградация
+      this.errorWindow = options.errorWindow || 30000; // 30 секунд
+      this.maxErrorsPerWindow = options.maxErrorsPerWindow || 3; // Всего 3 ошибки
+      this.degradationFactor = options.degradationFactor || 0.3; // Сильная деградация
       this.isDegraded = false;
       this.errorTimestamps = [];
       this.errorCleanupTimer = null;
       this.lastDegradationCheck = 0;
-      this.degradationCooldown = options.degradationCooldown || 5000; // 5 seconds
+      this.degradationCooldown = options.degradationCooldown || 3000; // 3 секунды
       
-      // Statistics
-      this.stats = {
-        totalTasks: 0,
-        completedTasks: 0,
-        failedTasks: 0,
-        queuedTasks: 0,
-        timeouts: 0
+      // Enhanced performance tracking
+      this.performanceMetrics = {
+          totalTasks: 0,
+          completedTasks: 0,
+          failedTasks: 0,
+          queuedTasks: 0,
+          timeouts: 0,
+          degradationEvents: 0,
+          avgExecutionTime: 0,
+          peakConcurrency: 0,
+          lastExecutionTime: 0
       };
       
-      // Internal state
+      // Circuit breaker for task execution
+      this.circuitBreaker = {
+          isOpen: false,
+          failureCount: 0,
+          failureThreshold: 5,
+          resetTimeout: 15000, // 15 секунд
+          lastFailureTime: 0,
+          successCount: 0,
+          successThreshold: 3
+      };
+      
+      // Internal state with enhanced protection
       this.processingMutex = false;
       this.pendingProcess = false;
       this.schedulingLock = false;
       this.isShuttingDown = false;
       this.shutdownPromise = null;
+      this.emergencyMode = false;
+      
+      // Task execution tracking
+      this.executingTasks = new Map(); // taskId -> { startTime, timeout }
       
       this.startErrorCleanup();
-    }
-  
-    /**
-     * Starts periodic cleanup of old error timestamps
-     */
-    startErrorCleanup() {
+  }
+
+  startErrorCleanup() {
       this.errorCleanupTimer = setInterval(() => {
-        this.cleanupOldErrors();
-      }, Math.min(this.errorWindow / 4, 15000)); // Clean more frequently
-    }
-  
-    /**
-     * Cleans up old error timestamps with degradation stability
-     */
-    cleanupOldErrors() {
+          this.cleanupOldErrors();
+          this.checkCircuitBreaker();
+          this.monitorTaskExecution();
+      }, Math.min(this.errorWindow / 3, 10000)); // Более частая очистка
+  }
+
+  cleanupOldErrors() {
       const now = Date.now();
       const oldLength = this.errorTimestamps.length;
       this.errorTimestamps = this.errorTimestamps.filter(
-        timestamp => now - timestamp < this.errorWindow
+          timestamp => now - timestamp < this.errorWindow
       );
       
-      // Only check for recovery if enough time has passed to avoid flapping
+      // Более агрессивная проверка восстановления
       if (this.isDegraded && now - this.lastDegradationCheck > this.degradationCooldown) {
-        if (this.errorTimestamps.length < this.maxErrorsPerWindow * 0.3) { // 30% threshold for recovery
-          this.isDegraded = false;
-          this.lastDegradationCheck = now;
-          console.info('Worker pool recovered from degradation');
-        }
+          if (this.errorTimestamps.length === 0) { // Полное отсутствие ошибок для восстановления
+              this.isDegraded = false;
+              this.lastDegradationCheck = now;
+              console.info('Worker pool recovered from degradation');
+          }
       }
-    }
-  
-    /**
-     * Executes a task with concurrency control and priority support
-     * @param {Function} task - Async function to execute
-     * @param {object} options - Task options (priority, timeout)
-     * @returns {Promise} - Promise that resolves with task result
-     */
-    async execute(task, options = {}) {
+  }
+
+  checkCircuitBreaker() {
+      const now = Date.now();
+      
+      if (this.circuitBreaker.isOpen) {
+          // Check if reset timeout has passed
+          if (now - this.circuitBreaker.lastFailureTime > this.circuitBreaker.resetTimeout) {
+              this.circuitBreaker.isOpen = false;
+              this.circuitBreaker.failureCount = 0;
+              this.circuitBreaker.successCount = 0;
+              console.info('Worker pool circuit breaker reset');
+          }
+      }
+  }
+
+  monitorTaskExecution() {
+      const now = Date.now();
+      const staleTasks = [];
+      
+      // Check for stale executing tasks
+      for (const [taskId, taskInfo] of this.executingTasks) {
+          if (now - taskInfo.startTime > taskInfo.timeout * 1.5) {
+              staleTasks.push(taskId);
+          }
+      }
+      
+      // Clean up stale tasks
+      for (const taskId of staleTasks) {
+          this.executingTasks.delete(taskId);
+          console.warn(`Cleaned up stale task: ${taskId}`);
+      }
+  }
+
+  async execute(task, options = {}) {
       // Fast fail if shutting down
       if (this.isShuttingDown) {
-        throw new Error('Worker pool is shutting down');
+          throw new Error('Worker pool is shutting down');
+      }
+      
+      // Emergency mode check
+      if (this.emergencyMode) {
+          throw new Error('Worker pool in emergency mode');
+      }
+      
+      // Circuit breaker check
+      if (this.circuitBreaker.isOpen) {
+          this.performanceMetrics.failedTasks++;
+          throw new Error('Worker pool circuit breaker is open');
       }
       
       const priority = options.priority || 0;
-      const timeout = options.timeout || this.taskTimeout;
+      const timeout = Math.min(options.timeout || this.taskTimeout, 45000); // Максимум 45 секунд
       
-      // Use cached total for performance
+      // Aggressive queue size check
       if (this.totalQueuedTasks >= this.maxQueueSize) {
-        this.stats.failedTasks++;
-        throw new Error('Worker pool queue is full');
+          this.performanceMetrics.failedTasks++;
+          throw new Error('Worker pool queue is full');
       }
       
-      // Check backpressure after queue size check
+      // Enhanced backpressure check
       if (this.enableBackpressure && this.isOverloaded()) {
-        this.stats.failedTasks++;
-        throw new Error('Worker pool overloaded - backpressure applied');
+          this.performanceMetrics.failedTasks++;
+          throw new Error('Worker pool overloaded - backpressure applied');
       }
-  
+
       return new Promise((resolve, reject) => {
-        // Double-check shutdown state inside Promise constructor
-        if (this.isShuttingDown) {
-          reject(new Error('Worker pool is shutting down'));
-          return;
-        }
-  
-        const wrappedTask = {
-          task,
-          resolve,
-          reject,
-          priority,
-          timeout,
-          createdAt: Date.now(),
-          id: this.generateTaskId()
-        };
-  
-        this.stats.totalTasks++;
-        this.stats.queuedTasks++;
-        
-        // Add task to priority queue
-        this.addTaskToPriorityQueue(wrappedTask);
-        
-        // Schedule queue processing with race condition protection
-        this.scheduleQueueProcessingSafe();
+          if (this.isShuttingDown) {
+              reject(new Error('Worker pool is shutting down'));
+              return;
+          }
+
+          const taskId = this.generateTaskId();
+          const wrappedTask = {
+              task,
+              resolve,
+              reject,
+              priority,
+              timeout,
+              createdAt: Date.now(),
+              id: taskId
+          };
+
+          this.performanceMetrics.totalTasks++;
+          this.performanceMetrics.queuedTasks++;
+          
+          // Add task to priority queue
+          this.addTaskToPriorityQueue(wrappedTask);
+          
+          // Immediate scheduling for high-priority tasks
+          if (priority > 5) {
+              setImmediate(() => this.scheduleQueueProcessingSafe());
+          } else {
+              this.scheduleQueueProcessingSafe();
+          }
       });
-    }
-  
-    /**
-     * Adds task to appropriate priority queue
-     * @param {object} wrappedTask - Task to add
-     */
-    addTaskToPriorityQueue(wrappedTask) {
+  }
+
+  addTaskToPriorityQueue(wrappedTask) {
       const priority = wrappedTask.priority;
       if (!this.priorityQueues.has(priority)) {
-        this.priorityQueues.set(priority, []);
+          this.priorityQueues.set(priority, []);
       }
       this.priorityQueues.get(priority).push(wrappedTask);
       this.totalQueuedTasks++;
-    }
-  
-    /**
-     * Gets next task from highest priority queue with cleanup
-     * @returns {object|null} - Next task or null if no tasks
-     */
-    getNextTask() {
+  }
+
+  getNextTask() {
       if (this.totalQueuedTasks === 0) {
-        return null;
+          return null;
       }
-  
+
       const priorities = Array.from(this.priorityQueues.keys()).sort((a, b) => b - a);
       
       for (const priority of priorities) {
-        const queue = this.priorityQueues.get(priority);
-        if (queue && queue.length > 0) {
-          const task = queue.shift();
-          this.stats.queuedTasks--;
-          this.totalQueuedTasks--;
-          
-          // Clean up empty priority queues to prevent memory leak
-          if (queue.length === 0) {
-            this.priorityQueues.delete(priority);
+          const queue = this.priorityQueues.get(priority);
+          if (queue && queue.length > 0) {
+              const task = queue.shift();
+              this.performanceMetrics.queuedTasks--;
+              this.totalQueuedTasks--;
+              
+              // Clean up empty priority queues
+              if (queue.length === 0) {
+                  this.priorityQueues.delete(priority);
+              }
+              
+              return task;
           }
-          
-          return task;
-        }
       }
       
       // Sync cache if inconsistent
       this.syncQueueCache();
       return null;
-    }
-  
-    /**
-     * Syncs the cached queue count with actual queues
-     */
-    syncQueueCache() {
+  }
+
+  syncQueueCache() {
       let actualTotal = 0;
       for (const queue of this.priorityQueues.values()) {
-        actualTotal += queue.length;
+          actualTotal += queue.length;
       }
       
       if (this.totalQueuedTasks !== actualTotal) {
-        console.warn(`Queue cache inconsistency detected: cached=${this.totalQueuedTasks}, actual=${actualTotal}`);
-        this.totalQueuedTasks = actualTotal;
+          console.warn(`Queue cache inconsistency: cached=${this.totalQueuedTasks}, actual=${actualTotal}`);
+          this.totalQueuedTasks = actualTotal;
       }
-    }
-  
-    /**
-     * Race-condition safe scheduling with atomic lock
-     */
-    scheduleQueueProcessingSafe() {
-      // Atomic check and set
+  }
+
+  scheduleQueueProcessingSafe() {
       if (this.schedulingLock) {
-        this.pendingProcess = true;
-        return;
+          this.pendingProcess = true;
+          return;
       }
       
       this.schedulingLock = true;
       
       setImmediate(() => {
-        this.schedulingLock = false;
-        this.processQueueSafely();
+          this.schedulingLock = false;
+          this.processQueueSafely();
       });
-    }
-  
-    /**
-     * Thread-safe queue processing wrapper
-     */
-    async processQueueSafely() {
-      // Check if already processing
+  }
+
+  async processQueueSafely() {
       if (this.processingMutex) {
-        this.pendingProcess = true;
-        return;
+          this.pendingProcess = true;
+          return;
       }
       
       this.processingMutex = true;
@@ -220,294 +256,378 @@ class WorkerPool {
       this.pendingProcess = false;
       
       try {
-        await this.processQueue();
+          await this.processQueue();
       } finally {
-        this.processingMutex = false;
-        
-        // Process again if there was a pending request or new one arrived
-        if ((this.pendingProcess || hadPendingBefore) && !this.isShuttingDown) {
-          setImmediate(() => this.processQueueSafely());
-        }
+          this.processingMutex = false;
+          
+          if ((this.pendingProcess || hadPendingBefore) && !this.isShuttingDown) {
+              setImmediate(() => this.processQueueSafely());
+          }
       }
-    }
-  
-    /**
-     * Processes queued tasks if workers are available
-     */
-    async processQueue() {
+  }
+
+  async processQueue() {
       const effectiveMaxWorkers = this.getEffectiveMaxWorkers();
       
       while (this.activeWorkers < effectiveMaxWorkers && this.totalQueuedTasks > 0 && !this.isShuttingDown) {
-        const nextTask = this.getNextTask();
-        if (!nextTask) {
-          break;
-        }
-        
-        // Start task without waiting for it
-        this.runTask(nextTask);
+          const nextTask = this.getNextTask();
+          if (!nextTask) {
+              break;
+          }
+          
+          // Start task without waiting
+          this.runTaskOptimized(nextTask);
       }
-    }
-  
-    /**
-     * Gets effective max workers considering degradation
-     * @returns {number} - Effective worker limit
-     */
-    getEffectiveMaxWorkers() {
-      if (this.isShuttingDown) {
-        return 0;
+  }
+
+  getEffectiveMaxWorkers() {
+      if (this.isShuttingDown || this.emergencyMode) {
+          return 0;
+      }
+      
+      if (this.circuitBreaker.isOpen) {
+          return 0;
       }
       
       if (this.isDegraded) {
-        return Math.max(1, Math.floor(this.maxWorkers * this.degradationFactor));
+          return Math.max(1, Math.floor(this.maxWorkers * this.degradationFactor));
       }
+      
       return this.maxWorkers;
-    }
-  
-    /**
-     * Runs a task with timeout and error handling
-     * @param {object} wrappedTask - Task wrapper with resolve/reject
-     */
-    async runTask(wrappedTask) {
-      // Final shutdown check before starting work
-      if (this.isShuttingDown) {
-        wrappedTask.reject(new Error('Worker pool is shutting down'));
-        return;
+  }
+
+  async runTaskOptimized(wrappedTask) {
+      if (this.isShuttingDown || this.emergencyMode) {
+          wrappedTask.reject(new Error('Worker pool is shutting down'));
+          return;
       }
-  
+
       this.activeWorkers++;
-  
+      this.performanceMetrics.peakConcurrency = Math.max(this.performanceMetrics.peakConcurrency, this.activeWorkers);
+
+      // Track executing task
+      this.executingTasks.set(wrappedTask.id, {
+          startTime: Date.now(),
+          timeout: wrappedTask.timeout
+      });
+
       let timeoutId = null;
       let completed = false;
+      const taskStartTime = Date.now();
       
       const complete = (success, result) => {
-        if (completed) return false;
-        completed = true;
-        
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-          timeoutId = null;
-        }
-        
-        if (success) {
-          this.stats.completedTasks++;
-          wrappedTask.resolve(result);
-        } else {
-          this.stats.failedTasks++;
-          wrappedTask.reject(result);
-        }
-        
-        return true;
-      };
-  
-      try {
-        // Set up timeout
-        timeoutId = setTimeout(() => {
-          if (complete(false, new Error(`Task timeout after ${wrappedTask.timeout}ms`))) {
-            this.stats.timeouts++;
+          if (completed) return false;
+          completed = true;
+          
+          // Clean up
+          if (timeoutId) {
+              clearTimeout(timeoutId);
+              timeoutId = null;
           }
-        }, wrappedTask.timeout);
-  
-        // Execute task
-        const result = await wrappedTask.task();
-        complete(true, result);
-        
+          
+          this.executingTasks.delete(wrappedTask.id);
+          
+          // Update performance metrics
+          const executionTime = Date.now() - taskStartTime;
+          this.updatePerformanceMetrics(success, executionTime);
+          
+          if (success) {
+              this.performanceMetrics.completedTasks++;
+              this.recordCircuitBreakerSuccess();
+              wrappedTask.resolve(result);
+          } else {
+              this.performanceMetrics.failedTasks++;
+              this.recordCircuitBreakerFailure();
+              wrappedTask.reject(result);
+          }
+          
+          return true;
+      };
+
+      try {
+          // Set up aggressive timeout
+          timeoutId = setTimeout(() => {
+              if (complete(false, new Error(`Task timeout after ${wrappedTask.timeout}ms`))) {
+                  this.performanceMetrics.timeouts++;
+              }
+          }, wrappedTask.timeout);
+
+          // Execute task with error boundary
+          const result = await this.executeTaskWithErrorBoundary(wrappedTask.task);
+          complete(true, result);
+          
       } catch (error) {
-        if (complete(false, error)) {
-          this.recordError();
-        }
+          if (complete(false, error)) {
+              this.recordError();
+          }
       } finally {
-        this.activeWorkers--;
-        
-        // Schedule next processing only if not shutting down
-        if (!this.isShuttingDown && this.totalQueuedTasks > 0) {
-          this.scheduleQueueProcessingSafe();
-        }
+          this.activeWorkers--;
+          
+          if (!this.isShuttingDown && this.totalQueuedTasks > 0) {
+              this.scheduleQueueProcessingSafe();
+          }
       }
-    }
-  
-    /**
-     * Records error for graceful degradation with stability
-     */
-    recordError() {
+  }
+
+  async executeTaskWithErrorBoundary(task) {
+      try {
+          return await task();
+      } catch (error) {
+          // Enhanced error classification
+          if (error.name === 'AbortError') {
+              throw new Error('Task was aborted');
+          }
+          
+          if (error.message && error.message.includes('timeout')) {
+              throw new Error('Task execution timeout');
+          }
+          
+          throw error;
+      }
+  }
+
+  updatePerformanceMetrics(success, executionTime) {
+      this.performanceMetrics.lastExecutionTime = Date.now();
+      
+      if (success) {
+          // Update average execution time
+          const completedTasks = this.performanceMetrics.completedTasks;
+          const currentAvg = this.performanceMetrics.avgExecutionTime;
+          this.performanceMetrics.avgExecutionTime = 
+              (currentAvg * completedTasks + executionTime) / (completedTasks + 1);
+      }
+  }
+
+  recordCircuitBreakerSuccess() {
+      this.circuitBreaker.successCount++;
+      
+      if (this.circuitBreaker.isOpen && this.circuitBreaker.successCount >= this.circuitBreaker.successThreshold) {
+          this.circuitBreaker.isOpen = false;
+          this.circuitBreaker.failureCount = 0;
+          console.info('Worker pool circuit breaker closed after successful executions');
+      }
+  }
+
+  recordCircuitBreakerFailure() {
+      this.circuitBreaker.failureCount++;
+      this.circuitBreaker.lastFailureTime = Date.now();
+      this.circuitBreaker.successCount = 0;
+      
+      if (this.circuitBreaker.failureCount >= this.circuitBreaker.failureThreshold) {
+          this.circuitBreaker.isOpen = true;
+          console.warn(`Worker pool circuit breaker opened after ${this.circuitBreaker.failureCount} failures`);
+      }
+  }
+
+  recordError() {
       const now = Date.now();
       this.errorTimestamps.push(now);
       
-      // Only check for degradation if cooldown period has passed
       if (!this.isDegraded && now - this.lastDegradationCheck > this.degradationCooldown) {
-        if (this.errorTimestamps.length >= this.maxErrorsPerWindow) {
-          this.isDegraded = true;
-          this.lastDegradationCheck = now;
-          console.warn(`Worker pool degraded due to ${this.errorTimestamps.length} errors in ${this.errorWindow}ms`);
-        }
+          if (this.errorTimestamps.length >= this.maxErrorsPerWindow) {
+              this.isDegraded = true;
+              this.lastDegradationCheck = now;
+              this.performanceMetrics.degradationEvents++;
+              console.warn(`Worker pool degraded due to ${this.errorTimestamps.length} errors in ${this.errorWindow}ms`);
+          }
       }
-    }
-  
-    /**
-     * Checks if pool is overloaded for backpressure
-     * @returns {boolean} - True if overloaded
-     */
-    isOverloaded() {
+  }
+
+  isOverloaded() {
       const effectiveMaxWorkers = this.getEffectiveMaxWorkers();
       if (effectiveMaxWorkers === 0) return true;
       
       const utilization = this.activeWorkers / effectiveMaxWorkers;
       const queueUtilization = this.totalQueuedTasks / this.maxQueueSize;
       
+      // More aggressive overload detection
       return utilization >= this.backpressureThreshold || 
-             queueUtilization >= this.backpressureThreshold;
-    }
-  
-    /**
-     * Generates unique task ID
-     * @returns {string} - Unique task identifier
-     */
-    generateTaskId() {
-      return `task_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    }
-  
-    /**
-     * Gets current pool status with thread-safe reads
-     * @returns {object} - Pool statistics
-     */
-    getStatus() {
+             queueUtilization >= this.backpressureThreshold ||
+             this.circuitBreaker.isOpen ||
+             this.emergencyMode;
+  }
+
+  generateTaskId() {
+      return `task_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  }
+
+  getStatus() {
       const effectiveMaxWorkers = this.getEffectiveMaxWorkers();
+      const utilizationPercent = effectiveMaxWorkers > 0 ? 
+          (this.activeWorkers / effectiveMaxWorkers * 100).toFixed(1) + '%' : '0%';
+      const queueUtilizationPercent = (this.totalQueuedTasks / this.maxQueueSize * 100).toFixed(1) + '%';
       
       return {
-        activeWorkers: this.activeWorkers,
-        queuedTasks: this.totalQueuedTasks,
-        maxWorkers: this.maxWorkers,
-        effectiveMaxWorkers,
-        utilization: effectiveMaxWorkers > 0 ? (this.activeWorkers / effectiveMaxWorkers * 100).toFixed(1) + '%' : '0%',
-        queueUtilization: (this.totalQueuedTasks / this.maxQueueSize * 100).toFixed(1) + '%',
-        isDegraded: this.isDegraded,
-        isOverloaded: this.isOverloaded(),
-        isShuttingDown: this.isShuttingDown,
-        stats: { ...this.stats },
-        recentErrors: this.errorTimestamps.length,
-        priorityQueues: this.priorityQueues.size
+          // Basic status
+          activeWorkers: this.activeWorkers,
+          queuedTasks: this.totalQueuedTasks,
+          maxWorkers: this.maxWorkers,
+          effectiveMaxWorkers,
+          utilization: utilizationPercent,
+          queueUtilization: queueUtilizationPercent,
+          
+          // Health status
+          isDegraded: this.isDegraded,
+          isOverloaded: this.isOverloaded(),
+          isShuttingDown: this.isShuttingDown,
+          emergencyMode: this.emergencyMode,
+          
+          // Circuit breaker
+          circuitBreaker: {
+              isOpen: this.circuitBreaker.isOpen,
+              failureCount: this.circuitBreaker.failureCount,
+              successCount: this.circuitBreaker.successCount,
+              timeSinceLastFailure: this.circuitBreaker.lastFailureTime > 0 ? 
+                  Date.now() - this.circuitBreaker.lastFailureTime : null
+          },
+          
+          // Performance metrics
+          stats: { ...this.performanceMetrics },
+          
+          // Execution tracking
+          executingTasks: this.executingTasks.size,
+          recentErrors: this.errorTimestamps.length,
+          priorityQueues: this.priorityQueues.size,
+          
+          // Computed metrics
+          successRate: this.performanceMetrics.totalTasks > 0 ? 
+              ((this.performanceMetrics.completedTasks / this.performanceMetrics.totalTasks) * 100).toFixed(1) + '%' : '0%',
+          timeoutRate: this.performanceMetrics.totalTasks > 0 ? 
+              ((this.performanceMetrics.timeouts / this.performanceMetrics.totalTasks) * 100).toFixed(1) + '%' : '0%',
+          avgExecutionTime: Math.round(this.performanceMetrics.avgExecutionTime),
+          
+          version: '2.0.3-optimized'
       };
-    }
-  
-    /**
-     * Checks if pool is at capacity
-     * @returns {boolean} - True if all workers are busy
-     */
-    isAtCapacity() {
-      return this.activeWorkers >= this.getEffectiveMaxWorkers();
-    }
-  
-    /**
-     * Gets number of pending tasks (uses cached value)
-     * @returns {number} - Number of queued tasks
-     */
-    getPendingCount() {
+  }
+
+  isAtCapacity() {
+      return this.activeWorkers >= this.getEffectiveMaxWorkers() || this.isOverloaded();
+  }
+
+  getPendingCount() {
       return this.totalQueuedTasks;
-    }
-  
-    /**
-     * Clears all queued tasks (does not affect running tasks)
-     * @param {string} reason - Reason for clearing queue
-     */
-    clearQueue(reason = 'Queue cleared') {
+  }
+
+  clearQueue(reason = 'Queue cleared') {
       let clearedCount = 0;
       
       for (const [priority, queue] of this.priorityQueues) {
-        while (queue.length > 0) {
-          const task = queue.shift();
-          clearedCount++;
-          this.stats.queuedTasks--;
-          this.stats.failedTasks++;
-          task.reject(new Error(`Task cancelled - ${reason}`));
-        }
+          while (queue.length > 0) {
+              const task = queue.shift();
+              clearedCount++;
+              this.performanceMetrics.queuedTasks--;
+              this.performanceMetrics.failedTasks++;
+              task.reject(new Error(`Task cancelled - ${reason}`));
+          }
       }
       
       this.priorityQueues.clear();
       this.totalQueuedTasks = 0;
       
       if (clearedCount > 0) {
-        console.info(`Cleared ${clearedCount} queued tasks: ${reason}`);
+          console.info(`Cleared ${clearedCount} queued tasks: ${reason}`);
       }
-    }
-  
-    /**
-     * Updates maximum worker count with validation
-     * @param {number} newMax - New maximum worker count
-     */
-    setMaxWorkers(newMax) {
-      if (newMax < 1) {
-        throw new Error('Max workers must be at least 1');
+      
+      return clearedCount;
+  }
+
+  setMaxWorkers(newMax) {
+      if (newMax < 1 || newMax > 16) { // Жесткий лимит
+          throw new Error('Max workers must be between 1 and 16');
       }
       
       const oldMax = this.maxWorkers;
       this.maxWorkers = newMax;
       
+      // Adjust queue size proportionally
+      this.maxQueueSize = Math.max(newMax * 2, 8);
+      
       console.info(`Worker pool max workers changed from ${oldMax} to ${newMax}`);
       
-      // Schedule processing if we increased capacity
       if (newMax > oldMax && !this.isShuttingDown && this.totalQueuedTasks > 0) {
-        this.scheduleQueueProcessingSafe();
+          this.scheduleQueueProcessingSafe();
       }
-    }
-  
-    /**
-     * Waits for all active tasks to complete
-     * @param {number} timeout - Max time to wait in ms
-     * @returns {Promise<boolean>} - True if all tasks completed
-     */
-    async waitForIdle(timeout = 30000) {
+  }
+
+  async waitForIdle(timeout = 15000) { // Уменьшен таймаут
       const startTime = Date.now();
       
       while ((this.activeWorkers > 0 || this.totalQueuedTasks > 0) && !this.isShuttingDown) {
-        if (Date.now() - startTime > timeout) {
-          return false;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
+          if (Date.now() - startTime > timeout) {
+              return false;
+          }
+          await new Promise(resolve => setTimeout(resolve, 50)); // Более частая проверка
       }
       
       return true;
-    }
-  
-    /**
-     * Graceful shutdown of the worker pool
-     * @param {number} timeout - Max time to wait for completion
-     */
-    async shutdown(timeout = 30000) {
+  }
+
+  enableEmergencyMode(reason = 'Emergency mode activated') {
+      this.emergencyMode = true;
+      console.warn(`Worker pool emergency mode enabled: ${reason}`);
+      
+      // Clear all queued tasks
+      this.clearQueue('Emergency mode');
+      
+      // Force circuit breaker open
+      this.circuitBreaker.isOpen = true;
+      this.circuitBreaker.lastFailureTime = Date.now();
+  }
+
+  disableEmergencyMode() {
+      this.emergencyMode = false;
+      this.circuitBreaker.isOpen = false;
+      this.circuitBreaker.failureCount = 0;
+      console.info('Worker pool emergency mode disabled');
+  }
+
+  async shutdown(timeout = 10000) { // Уменьшен таймаут
       if (this.shutdownPromise) {
-        return this.shutdownPromise;
+          return this.shutdownPromise;
       }
       
-      this.shutdownPromise = this._performShutdown(timeout);
+      this.shutdownPromise = this._performOptimizedShutdown(timeout);
       return this.shutdownPromise;
-    }
-  
-    /**
-     * Internal shutdown implementation
-     * @param {number} timeout - Max time to wait for completion
-     */
-    async _performShutdown(timeout) {
-      console.info('Shutting down worker pool...');
+  }
+
+  async _performOptimizedShutdown(timeout) {
+      console.info('Shutting down optimized worker pool...');
       this.isShuttingDown = true;
       
       // Stop error cleanup timer
       if (this.errorCleanupTimer) {
-        clearInterval(this.errorCleanupTimer);
-        this.errorCleanupTimer = null;
+          clearInterval(this.errorCleanupTimer);
+          this.errorCleanupTimer = null;
       }
       
       // Clear queue immediately
-      this.clearQueue('Worker pool shutdown');
+      const clearedTasks = this.clearQueue('Worker pool shutdown');
       
-      // Wait for active tasks with proper timeout
-      const completed = await this.waitForIdle(timeout);
-      
-      if (!completed) {
-        console.warn(`Worker pool shutdown timeout - ${this.activeWorkers} tasks still running`);
-      } else {
-        console.info('Worker pool shutdown completed');
+      // Force-abort long-running tasks
+      for (const [taskId, taskInfo] of this.executingTasks) {
+          const runningTime = Date.now() - taskInfo.startTime;
+          if (runningTime > 5000) { // Abort tasks running longer than 5 seconds
+              console.warn(`Force-aborting long-running task ${taskId} (${runningTime}ms)`);
+              this.executingTasks.delete(taskId);
+          }
       }
       
+      // Wait for active tasks with aggressive timeout
+      const completed = await this.waitForIdle(Math.min(timeout, 5000));
+      
+      if (!completed) {
+          console.warn(`Optimized worker pool shutdown timeout - ${this.activeWorkers} tasks still running`);
+          // Force emergency mode to reject any remaining tasks
+          this.enableEmergencyMode('Shutdown timeout');
+      } else {
+          console.info('Optimized worker pool shutdown completed');
+      }
+      
+      // Final cleanup
+      this.executingTasks.clear();
+      
       return completed;
-    }
   }
-  
-  module.exports = WorkerPool;
+}
+
+module.exports = WorkerPool;

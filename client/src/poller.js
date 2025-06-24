@@ -1,513 +1,624 @@
-// client/src/poller.js
-
 const { v4: uuidv4 } = require('uuid');
 
 class Poller {
-  /**
-   * Creates a new poller instance
-   * @param {string} host - CF Worker host URL
-   * @param {object} options - Configuration options
-   */
-  constructor(host, options = {}) {
-    this.host = host.startsWith('http') ? host : `https://${host}`;
-    this.concurrency = options.concurrency || 16;
-    this.timeout = options.timeout || 30000; // 30 seconds
-    this.retryDelay = options.retryDelay || 1000; // 1 second
-    this.maxRetryDelay = options.maxRetryDelay || 30000; // 30 seconds
-    this.maxRequestSize = options.maxRequestSize || 10 * 1024 * 1024; // 10MB
-    this.heartbeatInterval = options.heartbeatInterval || 60000; // 1 minute
-    this.authKey = options.authKey || null;
-    this.prefix = options.prefix || '';
-    
-    this.isRunning = false;
-    this.pollingWorkers = [];
-    this.activeControllers = new Set();
-    this.workerPool = null;
-    this.requestHandler = null;
-    this.tunnelId = null;
-    this.heartbeatTimer = null;
-    this.lastHeartbeat = null;
-    this.client = null; // NEW: For auto-reconnect
-  }
+    constructor(host, options = {}) {
+        this.host = host.startsWith('http') ? host : `https://${host}`;
+        this.concurrency = Math.min(options.concurrency || 4, 6); // Ограничено 6 соединениями
+        this.timeout = options.timeout || 10000; // Уменьшено до 10 секунд
+        this.retryDelay = options.retryDelay || 500; // Уменьшено
+        this.maxRetryDelay = options.maxRetryDelay || 5000; // Уменьшено
+        this.maxRequestSize = options.maxRequestSize || 2 * 1024 * 1024; // 2MB
+        this.heartbeatInterval = options.heartbeatInterval || 30000; // 30 секунд
+        this.authKey = options.authKey || null;
+        this.prefix = options.prefix || '';
+        
+        this.isRunning = false;
+        this.pollingWorkers = [];
+        this.activeControllers = new Set();
+        this.workerPool = null;
+        this.requestHandler = null;
+        this.tunnelId = null;
+        this.heartbeatTimer = null;
+        this.lastHeartbeat = null;
+        this.client = null;
 
-  /**
-   * Sets the worker pool for processing requests
-   * @param {WorkerPool} workerPool - Worker pool instance
-   */
-  setWorkerPool(workerPool) {
-    this.workerPool = workerPool;
-  }
+        // Enhanced connection tracking
+        this.connectionStats = {
+            totalPolls: 0,
+            successfulPolls: 0,
+            emptyPolls: 0,
+            timeouts: 0,
+            errors: 0,
+            lastPollTime: 0,
+            avgPollDuration: 0
+        };
 
-  /**
-   * Sets the request handler function
-   * @param {Function} handler - Async function to handle requests
-   */
-  setRequestHandler(handler) {
-    this.requestHandler = handler;
-  }
+        // Adaptive polling
+        this.adaptivePolling = {
+            enabled: true,
+            baseInterval: 100, // Очень короткий базовый интервал
+            maxInterval: 2000, // Максимум 2 секунды
+            currentInterval: 100,
+            backoffFactor: 1.2,
+            recoveryFactor: 0.8,
+            consecutiveEmpty: 0,
+            maxConsecutiveEmpty: 5
+        };
 
-  /**
-   * Sets the tunnel ID for this client
-   * @param {string} tunnelId - Unique tunnel identifier
-   */
-  setTunnelId(tunnelId) {
-    this.tunnelId = tunnelId;
-  }
-
-  /**
-   * Set client reference for auto-reconnection
-   * @param {TunnelClient} client - Client instance
-   */
-  setClient(client) {
-    this.client = client;
-  }
-
-  /**
-   * Gets base headers for server requests
-   * @returns {object} - Headers object
-   */
-  getBaseHeaders() {
-    const headers = {
-      'Accept': 'application/json',
-      'User-Agent': 'flarepipe-client/1.2.0'
-    };
-    
-    if (this.authKey) {
-      headers['Authorization'] = `Bearer ${this.authKey}`;
-    }
-    
-    return headers;
-  }
-
-  /**
-   * Builds API URL with prefix
-   * @param {string} endpoint - API endpoint (e.g., 'register', 'poll')
-   * @returns {string} - Full API URL
-   */
-  buildApiUrl(endpoint) {
-    if (this.prefix) {
-      return `${this.host}/${this.prefix}/${endpoint}`;
-    }
-    return `${this.host}/${endpoint}`;
-  }
-
-  /**
-   * Starts polling with multiple concurrent workers
-   */
-  async start() {
-    if (this.isRunning) {
-      return;
+        // Health monitoring
+        this.healthCheck = {
+            lastHealthyTime: Date.now(),
+            unhealthyThreshold: 60000, // 1 минута без успешных запросов
+            maxConsecutiveErrors: 3,
+            consecutiveErrors: 0
+        };
     }
 
-    if (!this.requestHandler) {
-      throw new Error('Request handler must be set before starting');
+    setWorkerPool(workerPool) {
+        this.workerPool = workerPool;
     }
 
-    this.isRunning = true;
-    this.lastHeartbeat = Date.now();
-    
-    // Start heartbeat monitoring
-    this.startHeartbeat();
-    
-    // Start multiple polling workers
-    for (let i = 0; i < this.concurrency; i++) {
-      const worker = this.createPollingWorker(i);
-      this.pollingWorkers.push(worker);
+    setRequestHandler(handler) {
+        this.requestHandler = handler;
     }
-  }
 
-  /**
-   * Stops all polling workers
-   */
-  async stop() {
-    this.isRunning = false;
-    
-    // Stop heartbeat
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
+    setTunnelId(tunnelId) {
+        this.tunnelId = tunnelId;
     }
-    
-    // Abort all active requests
-    for (const controller of this.activeControllers) {
-      controller.abort();
+
+    setClient(client) {
+        this.client = client;
     }
-    this.activeControllers.clear();
-    
-    // Wait for all workers to finish
-    await Promise.allSettled(this.pollingWorkers);
-    this.pollingWorkers = [];
-  }
 
-  /**
-   * Starts heartbeat monitoring
-   */
-  startHeartbeat() {
-    this.heartbeatTimer = setInterval(async () => {
-      try {
-        await this.sendHeartbeat();
-        this.lastHeartbeat = Date.now();
-      } catch (error) {
-        console.error('Heartbeat failed:', error.message);
-        // If heartbeat fails multiple times, consider reconnecting
-        const timeSinceLastSuccess = Date.now() - this.lastHeartbeat;
-        if (timeSinceLastSuccess > this.heartbeatInterval * 3) {
-          console.warn('Multiple heartbeat failures, connection may be lost');
-        }
-      }
-    }, this.heartbeatInterval);
-  }
-
-  /**
-   * Sends heartbeat to server
-   */
-  async sendHeartbeat() {
-    const controller = new AbortController();
-    this.activeControllers.add(controller);
-    
-    try {
-      const headers = {
-        'Content-Type': 'application/json',
-        ...this.getBaseHeaders()
-      };
-
-      const response = await fetch(this.buildApiUrl('heartbeat'), {
-        method: 'POST',
-        signal: controller.signal,
-        headers: headers,
-        body: JSON.stringify({
-          tunnel_id: this.tunnelId,
-          timestamp: Date.now()
-        })
-      });
-
-      if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
-          throw new Error(`Authentication failed during heartbeat`);
-        }
-        throw new Error(`Heartbeat failed: ${response.status}`);
-      }
-    } finally {
-      this.activeControllers.delete(controller);
-    }
-  }
-
-  /**
-   * Enhanced polling with auto-reconnect for Durable Objects
-   */
-  async createPollingWorker(workerId) {
-    let currentRetryDelay = this.retryDelay;
-    let consecutiveErrors = 0;
-    const maxConsecutiveErrors = 5;
-
-    while (this.isRunning) {
-      try {
-        await this.pollOnce();
-        // Reset retry delay and error count on successful poll
-        currentRetryDelay = this.retryDelay;
-        consecutiveErrors = 0;
-      } catch (error) {
-        if (!this.isRunning) {
-          break;
-        }
-
-        consecutiveErrors++;
-
-        // Don't log abort errors
-        if (error.name !== 'AbortError') {
-          console.error(`Poller worker ${workerId} error (${consecutiveErrors}/${maxConsecutiveErrors}):`, error.message);
-        }
-
-        // Handle specific errors
-        if (error.message.includes('404') || error.message.includes('Tunnel not found')) {
-          console.log('🔄 Tunnel lost, attempting to re-register...');
-          try {
-            await this.handleTunnelLost();
-            consecutiveErrors = 0; // Reset on successful re-registration
-            continue;
-          } catch (reregisterError) {
-            console.error('Failed to re-register tunnel:', reregisterError.message);
-          }
-        }
-
-        // If too many consecutive errors, try to reconnect
-        if (consecutiveErrors >= maxConsecutiveErrors) {
-          console.warn(`Too many consecutive errors (${consecutiveErrors}), attempting full reconnect...`);
-          try {
-            await this.handleFullReconnect();
-            consecutiveErrors = 0;
-            currentRetryDelay = this.retryDelay;
-            continue;
-          } catch (reconnectError) {
-            console.error('Full reconnect failed:', reconnectError.message);
-          }
+    getBaseHeaders() {
+        const headers = {
+            'Accept': 'application/json',
+            'User-Agent': 'flarepipe-client/2.0.3-optimized',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache'
+        };
+        
+        if (this.authKey) {
+            headers['Authorization'] = `Bearer ${this.authKey}`;
         }
         
-        // Exponential backoff with jitter
-        const jitter = Math.random() * 0.1 * currentRetryDelay;
-        await this.sleep(currentRetryDelay + jitter);
-        currentRetryDelay = Math.min(currentRetryDelay * 2, this.maxRetryDelay);
-      }
-    }
-  }
-
-  /**
-   * Handle tunnel lost scenario (404 errors)
-   */
-  async handleTunnelLost() {
-    if (!this.client) {
-      throw new Error('No client reference available for re-registration');
+        return headers;
     }
 
-    console.log('🔄 Re-registering tunnel after loss...');
-    
-    // Re-register tunnel
-    await this.client.registerTunnel();
-    
-    // Update tunnel ID
-    this.setTunnelId(this.client.tunnelId);
-    
-    console.log(`✅ Tunnel re-registered with new ID: ${this.client.tunnelId}`);
-  }
-
-  /**
-   * Handle full reconnection (multiple errors)
-   */
-  async handleFullReconnect() {
-    if (!this.client) {
-      throw new Error('No client reference available for reconnection');
+    buildApiUrl(endpoint) {
+        if (this.prefix) {
+            return `${this.host}/${this.prefix}/${endpoint}`;
+        }
+        return `${this.host}/${endpoint}`;
     }
 
-    console.log('🔄 Performing full reconnect...');
-    
-    try {
-      // Stop current operations
-      const oldTunnelId = this.tunnelId;
-      
-      // Try to unregister old tunnel (best effort)
-      if (oldTunnelId) {
+    async start() {
+        if (this.isRunning) {
+            return;
+        }
+
+        if (!this.requestHandler) {
+            throw new Error('Request handler must be set before starting');
+        }
+
+        this.isRunning = true;
+        this.lastHeartbeat = Date.now();
+        this.healthCheck.lastHealthyTime = Date.now();
+        
+        // Start optimized heartbeat
+        this.startOptimizedHeartbeat();
+        
+        // Start multiple polling workers with staggered start
+        for (let i = 0; i < this.concurrency; i++) {
+            setTimeout(() => {
+                if (this.isRunning) {
+                    const worker = this.createOptimizedPollingWorker(i);
+                    this.pollingWorkers.push(worker);
+                }
+            }, i * 200); // 200ms между запусками воркеров
+        }
+    }
+
+    async stop() {
+        this.isRunning = false;
+        
+        // Stop heartbeat
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
+        
+        // Abort all active requests
+        for (const controller of this.activeControllers) {
+            try {
+                controller.abort();
+            } catch (error) {
+                // Ignore abort errors
+            }
+        }
+        this.activeControllers.clear();
+        
+        // Wait for all workers to finish with timeout
+        const workerPromises = this.pollingWorkers.map(worker => 
+            Promise.race([
+                worker,
+                new Promise(resolve => setTimeout(resolve, 2000)) // 2 секунды максимум
+            ])
+        );
+        
+        await Promise.allSettled(workerPromises);
+        this.pollingWorkers = [];
+    }
+
+    startOptimizedHeartbeat() {
+        this.heartbeatTimer = setInterval(async () => {
+            try {
+                await this.sendOptimizedHeartbeat();
+                this.lastHeartbeat = Date.now();
+                this.healthCheck.consecutiveErrors = 0;
+            } catch (error) {
+                this.healthCheck.consecutiveErrors++;
+                console.error('Heartbeat failed:', error.message);
+                
+                if (this.healthCheck.consecutiveErrors >= this.healthCheck.maxConsecutiveErrors) {
+                    console.warn('Multiple heartbeat failures, connection may be unstable');
+                }
+            }
+        }, this.heartbeatInterval);
+    }
+
+    async sendOptimizedHeartbeat() {
+        const controller = new AbortController();
+        this.activeControllers.add(controller);
+        
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
         try {
-          await this.client.unregisterTunnel();
+            const headers = {
+                'Content-Type': 'application/json',
+                ...this.getBaseHeaders()
+            };
+
+            const response = await fetch(this.buildApiUrl('heartbeat'), {
+                method: 'POST',
+                signal: controller.signal,
+                headers: headers,
+                body: JSON.stringify({
+                    tunnel_id: this.tunnelId,
+                    timestamp: Date.now(),
+                    stats: this.getPollerStats()
+                })
+            });
+
+            if (!response.ok) {
+                if (response.status === 401 || response.status === 403) {
+                    throw new Error(`Authentication failed during heartbeat`);
+                }
+                if (response.status === 404) {
+                    throw new Error(`Tunnel not found during heartbeat`);
+                }
+                throw new Error(`Heartbeat failed: ${response.status}`);
+            }
+            
+            this.healthCheck.lastHealthyTime = Date.now();
+            
+        } finally {
+            clearTimeout(timeoutId);
+            this.activeControllers.delete(controller);
+        }
+    }
+
+    async createOptimizedPollingWorker(workerId) {
+        let currentRetryDelay = this.retryDelay;
+        let consecutiveErrors = 0;
+        const maxConsecutiveErrors = 3;
+
+        console.info(`🔄 Starting optimized polling worker ${workerId}`);
+
+        while (this.isRunning) {
+            const pollStartTime = Date.now();
+            
+            try {
+                const hasRequest = await this.pollOnceOptimized();
+                
+                // Успешный poll
+                consecutiveErrors = 0;
+                currentRetryDelay = this.retryDelay;
+                this.healthCheck.consecutiveErrors = 0;
+                this.healthCheck.lastHealthyTime = Date.now();
+                
+                // Adaptive polling based on activity
+                if (hasRequest) {
+                    this.adjustPollingInterval(true);
+                } else {
+                    this.adjustPollingInterval(false);
+                    await this.sleep(this.adaptivePolling.currentInterval);
+                }
+                
+            } catch (error) {
+                if (!this.isRunning) {
+                    break;
+                }
+
+                consecutiveErrors++;
+                this.healthCheck.consecutiveErrors++;
+
+                if (error.name !== 'AbortError') {
+                    console.error(`Poller worker ${workerId} error (${consecutiveErrors}/${maxConsecutiveErrors}):`, error.message);
+                }
+
+                // Handle specific errors
+                if (error.message.includes('404') || error.message.includes('Tunnel not found')) {
+                    console.log('🔄 Tunnel lost, attempting to re-register...');
+                    try {
+                        await this.handleTunnelLost();
+                        consecutiveErrors = 0;
+                        continue;
+                    } catch (reregisterError) {
+                        console.error('Failed to re-register tunnel:', reregisterError.message);
+                    }
+                }
+
+                // Circuit breaker for polling workers
+                if (consecutiveErrors >= maxConsecutiveErrors) {
+                    console.warn(`Worker ${workerId} circuit breaker activated, attempting full reconnect...`);
+                    try {
+                        await this.handleFullReconnect();
+                        consecutiveErrors = 0;
+                        currentRetryDelay = this.retryDelay;
+                        continue;
+                    } catch (reconnectError) {
+                        console.error('Full reconnect failed:', reconnectError.message);
+                        currentRetryDelay = Math.min(currentRetryDelay * 2, this.maxRetryDelay);
+                    }
+                }
+                
+                // Adaptive backoff with jitter
+                const jitter = Math.random() * 0.3 * currentRetryDelay;
+                const delay = currentRetryDelay + jitter;
+                await this.sleep(delay);
+                
+                currentRetryDelay = Math.min(currentRetryDelay * 1.5, this.maxRetryDelay);
+            }
+        }
+        
+        console.info(`🛑 Polling worker ${workerId} stopped`);
+    }
+
+    async pollOnceOptimized() {
+        const controller = new AbortController();
+        this.activeControllers.add(controller);
+        
+        const pollStartTime = Date.now();
+        
+        try {
+            const pollUrl = `${this.buildApiUrl('poll')}${this.tunnelId ? `?tunnel_id=${this.tunnelId}` : ''}`;
+            
+            const timeoutId = setTimeout(() => controller.abort(), Math.min(this.timeout, 8000));
+            
+            try {
+                const response = await fetch(pollUrl, {
+                    method: 'GET',
+                    signal: controller.signal,
+                    headers: {
+                        ...this.getBaseHeaders(),
+                        'X-Poll-Worker': 'optimized',
+                        'X-Expected-Timeout': String(this.timeout)
+                    }
+                });
+
+                clearTimeout(timeoutId);
+                
+                const duration = Date.now() - pollStartTime;
+                this.updateConnectionStats(true, duration);
+
+                if (response.status === 404) {
+                    throw new Error('Tunnel not found (404) - tunnel may have expired');
+                }
+
+                if (response.status === 401 || response.status === 403) {
+                    throw new Error('Authentication failed - check auth key');
+                }
+
+                if (response.status === 503) {
+                    throw new Error('Service temporarily unavailable - server overloaded');
+                }
+
+                if (response.status === 204) {
+                    this.connectionStats.emptyPolls++;
+                    return false;
+                }
+
+                if (!response.ok) {
+                    throw new Error(`Poll request failed: ${response.status} ${response.statusText}`);
+                }
+
+                const requestId = response.headers.get('X-Request-ID');
+                const method = response.headers.get('X-Method');
+                const path = response.headers.get('X-Path');
+                const query = response.headers.get('X-Query');
+                const headersJson = response.headers.get('X-Headers');
+                const timestamp = response.headers.get('X-Timestamp');
+                const shardId = response.headers.get('X-Shard-ID');
+
+                if (!requestId || !method || !path) {
+                    throw new Error('Missing required request metadata in headers');
+                }
+
+                let requestHeaders = {};
+                if (headersJson) {
+                    try {
+                        requestHeaders = JSON.parse(headersJson);
+                    } catch (parseError) {
+                        console.warn('Failed to parse request headers:', parseError.message);
+                    }
+                }
+
+                const body = await response.arrayBuffer();
+                
+                if (body.byteLength > this.maxRequestSize) {
+                    throw new Error(`Request too large: ${body.byteLength} bytes`);
+                }
+
+                const requestData = {
+                    id: requestId,
+                    method: method,
+                    path: path,
+                    query: query || '',
+                    headers: requestHeaders,
+                    body: body,
+                    timestamp: timestamp ? parseInt(timestamp, 10) : Date.now(),
+                    shardId: shardId,
+                    receivedAt: Date.now()
+                };
+                
+                if (requestData && requestData.id) {
+                    this.processRequestOptimized(requestData);
+                    return true;
+                }
+                
+                return false;
+                
+            } finally {
+                clearTimeout(timeoutId);
+            }
+            
         } catch (error) {
-          console.warn('Failed to unregister old tunnel:', error.message);
+            const duration = Date.now() - pollStartTime;
+            this.updateConnectionStats(false, duration);
+            
+            if (error.name === 'AbortError') {
+                this.connectionStats.timeouts++;
+            } else {
+                this.connectionStats.errors++;
+            }
+            
+            throw error;
+        } finally {
+            this.activeControllers.delete(controller);
         }
-      }
-      
-      // Re-register with new tunnel
-      await this.client.registerTunnel();
-      this.setTunnelId(this.client.tunnelId);
-      
-      console.log(`✅ Full reconnect completed with new tunnel: ${this.client.tunnelId}`);
-      
-    } catch (error) {
-      console.error('Full reconnect failed:', error.message);
-      throw error;
     }
-  }
 
-  /**
-   * Enhanced pollOnce with better error handling
-   */
-  async pollOnce() {
-    const controller = new AbortController();
-    this.activeControllers.add(controller);
-    
-    try {
-      const pollUrl = `${this.buildApiUrl('poll')}${this.tunnelId ? `?tunnel_id=${this.tunnelId}` : ''}`;
-      
-      const response = await fetch(pollUrl, {
-        method: 'GET',
-        signal: controller.signal,
-        headers: this.getBaseHeaders()
-      });
-
-      // Handle specific HTTP error codes
-      if (response.status === 404) {
-        throw new Error('Tunnel not found (404) - tunnel may have expired');
-      }
-
-      if (response.status === 401 || response.status === 403) {
-        throw new Error('Authentication failed - check auth key');
-      }
-
-      if (response.status === 204) {
-        // No requests available, continue polling
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error(`Poll request failed: ${response.status} ${response.statusText}`);
-      }
-
-      // Extract metadata from headers
-      const requestId = response.headers.get('X-Request-ID');
-      const method = response.headers.get('X-Method');
-      const path = response.headers.get('X-Path');
-      const query = response.headers.get('X-Query');
-      const headersJson = response.headers.get('X-Headers');
-      const timestamp = response.headers.get('X-Timestamp');
-
-      if (!requestId || !method || !path) {
-        throw new Error('Missing required request metadata in headers');
-      }
-
-      // Parse request headers
-      let requestHeaders = {};
-      if (headersJson) {
-        try {
-          requestHeaders = JSON.parse(headersJson);
-        } catch (parseError) {
-          console.warn('Failed to parse request headers:', parseError.message);
-        }
-      }
-
-      // Get RAW BINARY body as ArrayBuffer
-      const body = await response.arrayBuffer();
-
-      // Check content size
-      if (body.byteLength > this.maxRequestSize) {
-        throw new Error(`Request too large: ${body.byteLength} bytes`);
-      }
-
-      // Reconstruct request data
-      const requestData = {
-        id: requestId,
-        method: method,
-        path: path,
-        query: query || '',
-        headers: requestHeaders,
-        body: body, // ArrayBuffer - RAW BINARY
-        timestamp: timestamp ? parseInt(timestamp, 10) : Date.now()
-      };
-      
-      if (requestData && requestData.id) {
-        // Process request through worker pool with timeout
-        const requestPromise = this.processRequestWithTimeout(requestData);
+    processRequestOptimized(requestData) {
+        const requestPromise = this.processRequestWithOptimizedTimeout(requestData);
         
         if (this.workerPool) {
-          this.workerPool.execute(() => requestPromise);
+            this.workerPool.execute(() => requestPromise, { priority: 10 });
         } else {
-          // Fallback: process directly
-          setImmediate(() => requestPromise);
+            setImmediate(() => requestPromise);
         }
-      }
-    } finally {
-      this.activeControllers.delete(controller);
     }
-  }
 
-  /**
-   * Processes request with timeout to prevent memory leaks
-   * @param {object} requestData - Request data from server
-   */
-  async processRequestWithTimeout(requestData) {
-    const requestTimeout = 5 * 60 * 1000; // 5 minutes max per request
-    
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Request timeout')), requestTimeout);
-    });
+    async processRequestWithOptimizedTimeout(requestData) {
+        const requestTimeout = 30000;
+        
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Request processing timeout')), requestTimeout);
+        });
 
-    try {
-      await Promise.race([
-        this.processRequest(requestData),
-        timeoutPromise
-      ]);
-    } catch (error) {
-      console.error(`Request ${requestData.id} failed:`, error.message);
+        try {
+            await Promise.race([
+                this.processRequest(requestData),
+                timeoutPromise
+            ]);
+        } catch (error) {
+            console.error(`Request ${requestData.id} failed:`, error.message);
+            
+            try {
+                await this.sendErrorResponse(requestData.id, error);
+            } catch (sendError) {
+                console.error('Failed to send error response:', sendError.message);
+            }
+        }
     }
-  }
 
-  /**
-   * Processes a single HTTP request
-   * @param {object} requestData - Request data from server
-   */
-  async processRequest(requestData) {
-    try {
-      const response = await this.requestHandler(requestData);
-      await this.sendResponse(requestData.id, response);
-    } catch (error) {
-      console.error('Error processing request:', error.message);
-      
-      // Send error response
-      await this.sendResponse(requestData.id, {
-        status: 500,
-        headers: { 'Content-Type': 'text/plain' },
-        body: new TextEncoder().encode('Internal tunnel error').buffer // ArrayBuffer
-      });
+    async processRequest(requestData) {
+        try {
+            const response = await this.requestHandler(requestData);
+            await this.sendOptimizedResponse(requestData.id, response);
+        } catch (error) {
+            console.error('Error processing request:', error.message);
+            await this.sendErrorResponse(requestData.id, error);
+        }
     }
-  }
 
-  /**
-   * Sends response back to the server
-   * @param {string} requestId - Request identifier
-   * @param {object} response - Response data with ArrayBuffer body
-   */
-  async sendResponse(requestId, response) {
-    const controller = new AbortController();
-    this.activeControllers.add(controller);
-    
-    try {
-      const responseUrl = this.buildApiUrl('response');
-      
-      const headers = {
-        'X-Request-ID': requestId,
-        'X-Tunnel-ID': this.tunnelId,
-        'X-Response-Status': String(response.status || 200),
-        'X-Response-Headers': JSON.stringify(response.headers || {}),
-        ...this.getBaseHeaders()
-      };
+    async sendOptimizedResponse(requestId, response) {
+        const controller = new AbortController();
+        this.activeControllers.add(controller);
+        
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        
+        try {
+            const responseUrl = this.buildApiUrl('response');
+            
+            const headers = {
+                'X-Request-ID': requestId,
+                'X-Tunnel-ID': this.tunnelId,
+                'X-Response-Status': String(response.status || 200),
+                'X-Response-Headers': JSON.stringify(response.headers || {}),
+                'Content-Type': 'application/octet-stream',
+                ...this.getBaseHeaders()
+            };
 
-      // Send ArrayBuffer directly as body - NO JSON serialization
-      const result = await fetch(responseUrl, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: headers,
-        body: response.body || new ArrayBuffer(0) // Direct ArrayBuffer transmission
-      });
+            const result = await fetch(responseUrl, {
+                method: 'POST',
+                signal: controller.signal,
+                headers: headers,
+                body: response.body || new ArrayBuffer(0)
+            });
 
-      if (!result.ok) {
-        if (result.status === 401 || result.status === 403) {
-          console.error(`Authentication failed when sending response`);
+            if (!result.ok) {
+                if (result.status === 401 || result.status === 403) {
+                    console.error(`Authentication failed when sending response`);
+                } else if (result.status === 404) {
+                    console.warn(`Request ${requestId} not found (may have timed out)`);
+                } else {
+                    console.error(`Failed to send response: ${result.status} ${result.statusText}`);
+                }
+            }
+            
+        } finally {
+            clearTimeout(timeoutId);
+            this.activeControllers.delete(controller);
+        }
+    }
+
+    async sendErrorResponse(requestId, error) {
+        const errorResponse = {
+            status: 500,
+            headers: { 
+                'Content-Type': 'text/plain',
+                'X-Error-Type': 'processing-error'
+            },
+            body: new TextEncoder().encode(`Request processing failed: ${error.message}`).buffer
+        };
+        
+        await this.sendOptimizedResponse(requestId, errorResponse);
+    }
+
+    adjustPollingInterval(hasActivity) {
+        if (!this.adaptivePolling.enabled) return;
+        
+        if (hasActivity) {
+            this.adaptivePolling.currentInterval = Math.max(
+                this.adaptivePolling.currentInterval * this.adaptivePolling.recoveryFactor,
+                this.adaptivePolling.baseInterval
+            );
+            this.adaptivePolling.consecutiveEmpty = 0;
         } else {
-          console.error(`Failed to send response: ${result.status} ${result.statusText}`);
+            this.adaptivePolling.consecutiveEmpty++;
+            
+            if (this.adaptivePolling.consecutiveEmpty >= this.adaptivePolling.maxConsecutiveEmpty) {
+                this.adaptivePolling.currentInterval = Math.min(
+                    this.adaptivePolling.currentInterval * this.adaptivePolling.backoffFactor,
+                    this.adaptivePolling.maxInterval
+                );
+            }
         }
-      }
-    } catch (error) {
-      if (error.name !== 'AbortError') {
-        console.error('Error sending response:', error.message);
-      }
-    } finally {
-      this.activeControllers.delete(controller);
     }
-  }
 
-  /**
-   * Sleep utility function
-   * @param {number} ms - Milliseconds to sleep
-   */
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
+    updateConnectionStats(success, duration) {
+        this.connectionStats.totalPolls++;
+        this.connectionStats.lastPollTime = Date.now();
+        
+        if (success) {
+            this.connectionStats.successfulPolls++;
+        }
+        
+        const count = this.connectionStats.totalPolls;
+        const currentAvg = this.connectionStats.avgPollDuration;
+        this.connectionStats.avgPollDuration = (currentAvg * (count - 1) + duration) / count;
+    }
 
-  /**
-   * Gets current poller status
-   * @returns {object} - Status information
-   */
-  getStatus() {
-    return {
-      isRunning: this.isRunning,
-      activeWorkers: this.pollingWorkers.length,
-      activeRequests: this.activeControllers.size,
-      host: this.host,
-      prefix: this.prefix,
-      tunnelId: this.tunnelId,
-      concurrency: this.concurrency,
-      lastHeartbeat: this.lastHeartbeat,
-      heartbeatHealthy: this.lastHeartbeat && (Date.now() - this.lastHeartbeat) < this.heartbeatInterval * 2,
-      authKeySet: !!this.authKey,
-      version: '1.2.0'
-    };
-  }
+    async handleTunnelLost() {
+        if (!this.client) {
+            throw new Error('No client reference available for re-registration');
+        }
+
+        console.log('🔄 Re-registering tunnel after loss...');
+        
+        await this.client.registerTunnel();
+        this.setTunnelId(this.client.tunnelId);
+        
+        console.log(`✅ Tunnel re-registered with new ID: ${this.client.tunnelId}`);
+    }
+
+    async handleFullReconnect() {
+        if (!this.client) {
+            throw new Error('No client reference available for reconnection');
+        }
+
+        console.log('🔄 Performing full reconnect...');
+        
+        try {
+            const oldTunnelId = this.tunnelId;
+            
+            if (oldTunnelId) {
+                try {
+                    await this.client.unregisterTunnel();
+                } catch (error) {
+                    console.warn('Failed to unregister old tunnel:', error.message);
+                }
+            }
+            
+            await this.client.registerTunnel();
+            this.setTunnelId(this.client.tunnelId);
+            
+            console.log(`✅ Full reconnect completed with new tunnel: ${this.client.tunnelId}`);
+            
+        } catch (error) {
+            console.error('Full reconnect failed:', error.message);
+            throw error;
+        }
+    }
+
+    getPollerStats() {
+        return {
+            connection: this.connectionStats,
+            adaptive_polling: this.adaptivePolling,
+            health: this.healthCheck,
+            active_workers: this.pollingWorkers.length,
+            active_requests: this.activeControllers.size
+        };
+    }
+
+    getStatus() {
+        const timeSinceLastPoll = this.connectionStats.lastPollTime > 0 ? 
+            Date.now() - this.connectionStats.lastPollTime : null;
+        
+        const isHealthy = this.healthCheck.consecutiveErrors === 0 && 
+                         timeSinceLastPoll !== null && timeSinceLastPoll < 30000;
+
+        return {
+            isRunning: this.isRunning,
+            activeWorkers: this.pollingWorkers.length,
+            activeRequests: this.activeControllers.size,
+            host: this.host,
+            prefix: this.prefix,
+            tunnelId: this.tunnelId,
+            concurrency: this.concurrency,
+            lastHeartbeat: this.lastHeartbeat,
+            heartbeatHealthy: this.lastHeartbeat && (Date.now() - this.lastHeartbeat) < this.heartbeatInterval * 2,
+            authKeySet: !!this.authKey,
+            version: '2.0.3-optimized',
+            
+            isHealthy: isHealthy,
+            timeSinceLastPoll: timeSinceLastPoll,
+            
+            stats: this.connectionStats,
+            adaptivePolling: this.adaptivePolling,
+            healthCheck: this.healthCheck,
+            
+            pollSuccessRate: this.connectionStats.totalPolls > 0 ? 
+                ((this.connectionStats.successfulPolls / this.connectionStats.totalPolls) * 100).toFixed(1) + '%' : '0%',
+            avgPollDuration: Math.round(this.connectionStats.avgPollDuration),
+            currentPollingInterval: this.adaptivePolling.currentInterval
+        };
+    }
+
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
 }
 
 module.exports = Poller;
